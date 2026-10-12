@@ -20,15 +20,16 @@ two.
 * **Randomized cameras.** Each episode gets N simultaneous third-person cameras sampled around
   both grippers, at varied azimuth, elevation and distance, and at least 45° apart. A view is
   kept only if both hands stay visible at several points of the episode, checked with
-  segmentation so occlusion counts. Each wrist camera gets a slightly jittered mount.
+  segmentation so occlusion counts. Each wrist camera gets a slightly jittered mount, kept
+  only if its own gripper stays in frame and its ray-traced view is clean.
 * **Bimanual visual calibration.** Every end-effector degree of freedom of each arm (x, y, z,
   roll, pitch, yaw) is swept out and back in a straight line while everything else holds
   still: 24 single-DoF legs. The exact frame span of every leg is recorded.
 * **Counterfactual episodes**, each checked to actually differ from the expert:
   * `noisy_replay`: smooth joint-space perturbations on the left, right, or both arms;
   * `scripted_diverge`: the expert up to a breakpoint, then scripted end-effector motions;
-  * `freeze_arm`: one arm stops while the other continues, which breaks the two arms'
-    coordination;
+  * `freeze_arm`: one arm stops, at a point where it still had somewhere to go, while the
+    other continues, which breaks the two arms' coordination;
   * `gripper_flip`: one gripper opens or closes when it shouldn't.
 * **Any two-arm embodiment RoboTwin supports**, including mixed pairs (e.g. a Piper left arm
   and a Franka right arm).
