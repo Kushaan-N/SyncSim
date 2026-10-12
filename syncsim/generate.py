@@ -85,6 +85,9 @@ class Config:
     wrist_rot_jitter_deg: float = 5.0
     wrist_min_frac: float = 0.03
     wrist_max_frac: float = 0.35
+    wrist_rt_check: bool = True              # ray-trace each wrist candidate in the gate too
+    wrist_rt_min_std: float = 6.0            # ray-traced wrist view must not be flat (0-255 std)
+    wrist_rt_min_corr: float = 0.5           # ... and must match the rasterised view (16x16 corr)
     # ---- calibration ----------------------------------------------------------------------
     record_calibration: bool = True
     calib_trans_m: tuple = (0.05, 0.08)
@@ -220,7 +223,8 @@ def _rig_json(rig, cfg):
         } for v_i, v in enumerate(rig["views"])],
         "wrist": {a: {"dir": f"wrist_{a}_rgb", "link": f"{a}_camera",
                       "rel_mat": w["rel_mat"], "stock_mount": w["stock"],
-                      "gate_gripper_frac": w["grip_frac"]} for a, w in rig["wrist"].items()},
+                      "gate_gripper_frac": w["grip_frac"],
+                      "gate_rt_check": w.get("rt_check"), "gate_rt_ok": w.get("rt_ok")} for a, w in rig["wrist"].items()},
         "camera_convention": "SAPIEN cam2world: x forward, y left, z up",
     }
 
