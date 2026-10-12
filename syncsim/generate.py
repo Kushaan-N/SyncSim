@@ -469,7 +469,8 @@ class Generator:
                 # every attempt raised (e.g. a planner error in a scripted suffix): fall back to
                 # a perturbation, which needs no planning, rather than losing the whole episode
                 mode, arm_sel = "noisy_replay", ("both" if arm_sel == "both" else arm_sel)
-            esc = cfg.cf_escalation ** min(attempt, n_att - 1)
+            # the planner-free fallback starts at normal strength, not the escalated one
+            esc = 1.0 if attempt == n_att else cfg.cf_escalation ** attempt
             arng = np.random.default_rng(rng.integers(1 << 31) + attempt)
             try:
                 res = self._cf_attempt(seed, mode, arm_sel, esc, arng, stream, expert_tcp,
