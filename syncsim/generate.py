@@ -110,6 +110,7 @@ class Config:
     cf_escalation: float = 1.6
     cf_min_prefix_frames: int = 4
     cf_min_suffix_frames: int = 24
+    freeze_min_motion_rad: float = 0.05      # freeze_arm only freezes an arm that still moves this much
     noise_sigma_rad: float = 0.12
     noise_wrist_scale: float = 0.6
     noise_interval_frames: int = 10          # ramp half-width
@@ -302,14 +303,16 @@ class Generator:
             return False
         if os.path.isdir(ep_dir):
             shutil.rmtree(ep_dir)
-        kept_units = 0
+        kept_units, reasons = 0, []
         for m in range(cfg.num_camera_units):
             unit = os.path.join(ep_dir, f"camera_poses_{m}")
-            if self.unit(seed, m, unit, stream, info):
-                kept_units += 1
+            ok, why = self.unit(seed, m, unit, stream, info)
+            kept_units += int(ok)
+            if not ok:
+                reasons.append(why)
         if kept_units == 0:
             shutil.rmtree(ep_dir, ignore_errors=True)
-            self._drop(seed, "no_camera_rig_passed_gate")
+            self._drop(seed, reasons[0] if reasons else "no_unit_kept")
             return False
         return True
 
@@ -326,7 +329,7 @@ class Generator:
                               cfg.frame_stride)
         if not rig["ok"]:
             print(f"    [gate] seed {seed} unit {m}: {rig['reason']}")
-            return False
+            return False, f"camera_gate: {rig['reason']}"
         os.makedirs(unit, exist_ok=True)
         write_json(os.path.join(unit, "views.json"), _rig_json(rig, cfg))
         stream.save(os.path.join(unit, "expert_stream.npz"))
@@ -334,18 +337,20 @@ class Generator:
         # ---- expert -------------------------------------------------------------------
         reset()
         rec = self._recorder(rig)
-        ro = Rollout(self.task, rec, cfg.frame_stride)
+        ro = Rollout(self.task, rec, cfg.frame_stride, poll_success=True)
         ro.run(stream)
-        expert_success = bool(self.task.check_success())
+        succ = ro.success()
+        expert_success = succ["final"]
         if not expert_success:
             print(f"    [expert] seed {seed}: stream replay no longer succeeds -- unit dropped")
             shutil.rmtree(unit, ignore_errors=True)
-            return False
+            return False, "expert_replay_not_successful"
         exp_dir = os.path.join(unit, "expert")
         n_frames = rec.save(exp_dir, self.fps, cfg.frame_stride, crf=cfg.video_crf)
         expert_tcp, expert_g = rec.tcp_track(), rec.gripper_track()
         write_json(os.path.join(exp_dir, "metadata.json"), {
             "episode_type": "expert", "seed": seed, "task": cfg.task, "success": expert_success,
+            "first_success_frame": succ["first_frame"],
             "frames": n_frames, "physics_steps": int(stream.n), "frame_stride": cfg.frame_stride,
             "fps": self.fps, "action_source": "robotwin_scripted_expert/stream_replay",
             "task_info": info})
@@ -368,7 +373,7 @@ class Generator:
 
         with open(os.path.join(unit, "_DONE"), "w") as f:
             f.write(time.strftime("%Y-%m-%dT%H:%M:%S"))
-        return True
+        return True, "ok"
 
     def _base_init(self, unit, seed, m, rig):
         from .recorder import ACTION_LAYOUT, write_json
@@ -409,7 +414,8 @@ class Generator:
             arng = np.random.default_rng(rng.integers(1 << 31) + attempt)
             self._reset(seed)
             dt = self.task.scene.get_timestep()
-            ro = Rollout(self.task, _TrackOnly(self.task), cfg.frame_stride, render=False)
+            ro = Rollout(self.task, _TrackOnly(self.task), cfg.frame_stride, render=False,
+                         poll_success=True)
             meta = {"counterfactual_mode": mode, "arms": arm_sel, "attempt": attempt,
                     "escalation": esc}
             if mode == "noisy_replay":
@@ -427,6 +433,14 @@ class Generator:
                 meta["breakpoint_step"] = int(p)
                 meta["breakpoint_frame"] = int(p // cfg.frame_stride)
                 if mode == "freeze_arm":
+                    # freezing an arm that never moves again is a no-op (click_bell: the
+                    # bell is on one side, the other arm stays home) -- freeze one that moves
+                    moving = [a for a in ("left", "right")
+                              if np.ptp(stream[f"{a}_q"][p:], axis=0).max() > cfg.freeze_min_motion_rad]
+                    if arm_sel not in moving and moving:
+                        arm_sel = moving[0] if len(moving) == 1 else arng.choice(moving)
+                        meta["arms"] = arm_sel
+                    meta["freeze_arm_moves_after_breakpoint"] = arm_sel in moving
                     s, info = CF.freeze_arm(stream, p, arm_sel)
                     ro.run(s)
                     meta["freeze"] = info
@@ -447,14 +461,16 @@ class Generator:
         # ---- render the accepted (or last) executed stream exactly ------------------------
         self._reset(seed)
         rec = self._recorder(rig)
-        ro = Rollout(self.task, rec, cfg.frame_stride)
+        ro = Rollout(self.task, rec, cfg.frame_stride, poll_success=True)
         ro.run(executed)
-        success = bool(self.task.check_success())
+        succ = ro.success()
+        success = succ["final"]
         cf_dir = os.path.join(unit, f"counterfactual_{k:03d}")
         n_frames = rec.save(cf_dir, self.fps, cfg.frame_stride, crf=cfg.video_crf)
         executed.save(os.path.join(cf_dir, "stream.npz"))
         meta.update({"episode_type": "counterfactual", "k": k, "seed": seed,
-                     "task_success": success, "frames": n_frames,
+                     "task_success": success, "task_success_ever": succ["ever"],
+                     "first_success_frame": succ["first_frame"], "frames": n_frames,
                      "physics_steps": int(executed.n), "fps": self.fps,
                      "divergence": dict(div, threshold_m=cfg.cf_min_tcp_deviation_m,
                                         accepted=bool(ok), attempt_log=attempts)})
