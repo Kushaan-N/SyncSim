@@ -32,31 +32,34 @@ def ee_pose(robot, arm):
     return np.asarray(getattr(robot, f"get_{arm}_ee_pose")(), dtype=np.float64)   # xyz + wxyz
 
 
+# RoboTwin's `get_*_ee_pose` point sits 0.12 m behind the gripper centre (TCP) along the
+# pose's own x axis, for every embodiment: Robot._trans_endpose offsets both from the same
+# link by `gripper_bias - 0.12` and `gripper_bias` respectively.
+EE_TO_TCP = 0.12
+
+
+def tcp_point(pose7):
+    """Gripper-centre position of an ee pose (xyz + wxyz)."""
+    p = np.asarray(pose7, dtype=np.float64)
+    return p[:3] + t3d.quaternions.quat2mat(p[3:7]) @ np.array([EE_TO_TCP, 0.0, 0.0])
+
+
 def displaced_pose(pose7, dof, amount):
-    """pose7 (xyz + wxyz) moved by `amount` (m for x/y/z, rad for roll/pitch/yaw)."""
+    """ee pose7 (xyz + wxyz) moved by `amount`: m along a world axis for x/y/z, rad about a
+    world axis THROUGH THE GRIPPER CENTRE for roll/pitch/yaw. Rotating about the ee point
+    instead would swing the gripper centre 3-4 cm per 20 deg, so a "roll" leg would also be a
+    translation in the recorded (TCP) actions."""
     out = np.array(pose7, dtype=np.float64)
     if dof in TRANS_DOFS:
         out[DOF_AXES[dof]] += amount
     else:
         axis = np.zeros(3)
         axis[DOF_AXES[dof]] = 1.0
+        tcp = tcp_point(out)
         R = t3d.axangles.axangle2mat(axis, amount) @ t3d.quaternions.quat2mat(out[3:7])
         out[3:7] = t3d.quaternions.mat2quat(R)
+        out[:3] = tcp - R @ np.array([EE_TO_TCP, 0.0, 0.0])
     return out
-
-
-def _screw_planner(robot, arm):
-    """A scene-independent mplib planner for `arm`, built once per Robot from its URDF.
-    (RoboTwin's own `*_mplib_planner` is bound to the scene that existed at first load.)"""
-    cache = robot.__dict__.setdefault("_syncsim_screw", {})
-    if arm not in cache:
-        import sys
-        from envs.robot.planner import MplibPlanner
-        cache[arm] = MplibPlanner(
-            getattr(robot, f"{arm}_urdf_path"), getattr(robot, f"{arm}_srdf_path"),
-            getattr(robot, f"{arm}_move_group"), getattr(robot, f"{arm}_entity_origion_pose"),
-            getattr(robot, f"{arm}_entity"), "mplib_screw", scene=None)
-    return cache[arm]
 
 
 def _slerp(q0, q1, t):
