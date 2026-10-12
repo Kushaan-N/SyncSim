@@ -358,12 +358,18 @@ class Generator:
 
         # ---- calibration ----------------------------------------------------------------
         if cfg.record_calibration:
+            # probe (unrendered, may retry legs) -> film only the accepted legs
+            from .calibration import render_clean
+            reset()
+            probe = Rollout(self.task, _TrackOnly(self.task), cfg.frame_stride, render=False)
+            mr = record_calibration(probe, _unit_rng(cfg, seed, m, "calibration"), cfg)
             reset()
             rec = self._recorder(rig)
             ro = Rollout(self.task, rec, cfg.frame_stride)
-            mr = record_calibration(ro, _unit_rng(cfg, seed, m, "calibration"), cfg)
+            render_clean(ro, mr)
             cal_dir = os.path.join(unit, "calibration")
             mr["frames"] = rec.save(cal_dir, self.fps, cfg.frame_stride, crf=cfg.video_crf)
+            mr["filmed"] = _filmed_leg_motion(rec, mr)
             ro.stream().save(os.path.join(cal_dir, "stream.npz"))
             write_json(os.path.join(cal_dir, "move_range.json"), mr)
 
@@ -478,6 +484,23 @@ class Generator:
         print(f"    [cf] seed {seed} unit {m} cf{k}: {mode}/{arm_sel} max_tcp "
               f"{div.get('max_tcp_m', 0):.3f} m gmis {div.get('gripper_mismatch_frac', 0):.2f} "
               f"success={success} attempts={len(attempts)}{'' if ok else ' (BELOW GATE)'}")
+
+
+def _filmed_leg_motion(rec, mr):
+    """Per accepted leg, the TCP motion actually filmed between out_start and out_end
+    (position change in m, rotation in deg) -- a check that the clean replay shows each leg."""
+    import transforms3d as t3d
+    out = []
+    for leg in mr["legs"]:
+        if "out_start_frame" not in leg:
+            continue
+        P = np.asarray(rec.log[f"{leg['arm']}_pose"])
+        a, b = P[leg["out_start_frame"]], P[min(leg["out_end_frame"], len(P) - 1)]
+        Ra, Rb = t3d.quaternions.quat2mat(a[3:7]), t3d.quaternions.quat2mat(b[3:7])
+        ang = float(np.degrees(np.arccos(np.clip((np.trace(Rb @ Ra.T) - 1) / 2, -1, 1))))
+        out.append({"leg": f"{leg['arm']}:{leg['dof']}{leg['sign']}",
+                    "dpos_m": (b[:3] - a[:3]).round(4).tolist(), "rot_deg": round(ang, 2)})
+    return out
 
 
 class _TrackOnly:
