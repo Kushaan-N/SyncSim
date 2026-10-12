@@ -131,7 +131,10 @@ def plan_to(robot, arm, target7, method="screw"):
             pass
         if method == "screw":
             return None
-    res = getattr(robot, f"{arm}_plan_path")(list(map(float, target7)))
+    try:
+        res = getattr(robot, f"{arm}_plan_path")(list(map(float, target7)))
+    except Exception:
+        return None
     if not isinstance(res, dict) or res.get("status") != "Success":
         return None
     return np.asarray(res["position"], dtype=np.float64)
