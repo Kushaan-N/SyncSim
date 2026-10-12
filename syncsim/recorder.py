@@ -10,7 +10,8 @@ On-disk layout of one rollout dir (mirrors robocasa-dev's, extended to two arms)
     pose.pkl                       per frame, both arms (see `save`)
     actions.npy                    [T, 16] per-frame action, see ACTION_LAYOUT
     joints.npy                     [T, dl+1+dr+1] measured arm joints + gripper (RoboTwin "qpos")
-    object_poses.npz               per frame world pose of every non-static scene actor
+    object_poses.npz               per frame world pose of every free-moving scene actor, and
+                                   joint positions + root pose of every articulated object
     metadata.json                  written by the caller
 
 Quaternions are stored xyzw (scipy / robosuite order, as in robocasa's pose.pkl) even though
@@ -71,6 +72,20 @@ def dynamic_actors(scene):
     return out
 
 
+def object_articulations(scene, robot):
+    """Non-robot articulations with at least one movable joint, in a stable order."""
+    def root_id(a):
+        return int(a.get_root().entity.per_scene_id)
+
+    robot_roots = {root_id(robot.left_entity), root_id(robot.right_entity)}
+    out = []
+    for a in scene.get_all_articulations():
+        if root_id(a) in robot_roots or not a.get_active_joints():
+            continue
+        out.append(a)
+    return out
+
+
 class RigRecorder:
     """Adds the rig's cameras to a freshly set-up task scene and captures frames."""
 
@@ -93,9 +108,10 @@ class RigRecorder:
         for a in self.wrist:
             self.frames[WRIST_DIRS[a]] = []
         self.actors = dynamic_actors(self.scene)
+        self.arts = object_articulations(self.scene, self.robot)
         self.log = {k: [] for k in ("left_pose", "right_pose", "left_mat", "right_mat",
                                     "left_g", "right_g", "left_g_real", "right_g_real",
-                                    "joints", "step", "objects")}
+                                    "joints", "step", "objects", "art_qpos", "art_root")}
 
     # ------------------------------------------------------------------------------------
     def poses_now(self):
@@ -129,6 +145,9 @@ class RigRecorder:
         L["step"].append(int(step_idx))
         L["objects"].append(np.array([np.concatenate([e.get_pose().p, e.get_pose().q])
                                       for e in self.actors], dtype=np.float64).reshape(-1, 7))
+        L["art_qpos"].append([np.asarray(a.get_qpos(), dtype=np.float64) for a in self.arts])
+        L["art_root"].append([np.concatenate([a.get_root_pose().p, a.get_root_pose().q])
+                              for a in self.arts])
 
     # ------------------------------------------------------------------------------------
     def tcp_track(self):
@@ -172,10 +191,18 @@ class RigRecorder:
             pickle.dump(pose, f)
         np.save(os.path.join(out_dir, "actions.npy"), self.actions())
         np.save(os.path.join(out_dir, "joints.npy"), np.asarray(L["joints"], dtype=np.float32))
+        arts = {}
+        for i, a in enumerate(self.arts):
+            # articulated objects (laptop lid, microwave door, cabinet drawer, ...): their state
+            # is joint positions, not a free-body pose. One array per articulation (dof varies).
+            arts[f"art{i}_qpos"] = np.asarray([f[i] for f in L["art_qpos"]], dtype=np.float32)
+            arts[f"art{i}_root_pose"] = np.asarray([f[i] for f in L["art_root"]], dtype=np.float32)
+            arts[f"art{i}_joint_names"] = np.array([j.get_name() for j in a.get_active_joints()])
         np.savez_compressed(os.path.join(out_dir, "object_poses.npz"),
                             poses=np.asarray(L["objects"], dtype=np.float32),
                             names=np.array([e.get_name() for e in self.actors]),
-                            quat_order="wxyz")
+                            art_names=np.array([a.get_name() for a in self.arts]),
+                            quat_order="wxyz", **arts)
         return len(L["step"])
 
 
