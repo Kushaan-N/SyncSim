@@ -83,6 +83,16 @@ jittered mount (±1 cm, ±5°) chosen by the robocasa **two-sided** gate on the 
 wrist image covered by that arm's own gripper; falls back to the stock mount (recorded as
 `stock_mount: true`).
 
+**The gate must see what the renderer sees.** The gate's segmentation camera is rasterised,
+which culls back faces: a lens jittered ~5 mm *back* into the wrist housing still sees the
+scene, while the ray tracer used for the videos renders the inside of the housing -- a dark or
+grey wall for the whole episode (≈10 % of pilot episodes). So (1) the position jitter is never
+backward along the optical axis, and (2) each wrist candidate is also ray-traced at the gate's
+first check frame (the defect is fixed to the link, so it shows there; later frames are
+object close-ups where the renderers legitimately differ) and must be non-flat and correlate with the rasterised view (16×16 block
+correlation ≥ 0.5; stock mounts score ≈ 0.9, lens-in-housing mounts ≤ 0.3). The scores are
+recorded in `views.json` (`gate_rt_check`, `gate_rt_ok`) and checked by `verify_set.py`.
+
 ---
 
 ## 4. Calibration (bimanual)
@@ -131,6 +141,12 @@ Robocasa lessons applied:
   gripper dim and was a no-op. Here every counterfactual is probed unrendered, measured
   against the expert (max TCP deviation per arm, gripper-command mismatch), and re-rolled
   with ×1.6 magnitude below 5 cm unless the gripper differs on ≥5 % of frames.
+* **Make sure it acts, for every mode.** `freeze_arm` draws its breakpoint only from frames
+  after which the frozen arm's TCP still travels ≥ `freeze_min_remaining_m` (8 cm; else freezing
+  is a no-op: late breakpoints, or the idle arm of a one-armed task); with no such frame for
+  either arm the counterfactual becomes `noisy_replay`. If every attempt of any mode stays
+  below the divergence gate, a planner-free `noisy_replay` fallback runs and the more
+  divergent rollout is kept.
 * **Reserve a suffix.** Breakpoints keep ≥ `CF_MIN_SUFFIX_FRAMES` after them (robocasa's
   `scripted_diverge` had a 7 % near-expert tail from late breakpoints).
 * **Mix the task into seeds** (robocasa's `cf_task_seed_salt` fix): all RNG streams include
