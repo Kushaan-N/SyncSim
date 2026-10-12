@@ -98,6 +98,18 @@ controlled, so each leg is **planned with curobo** from the current state and **
 constant speed** (`motion.retime`); magnitude (distance) and speed are independent knobs.
 Unreachable legs retry at 60 % and 35 % of the magnitude, else are recorded as skipped.
 
+**Probe, then film.** The sweep is first run unrendered; a leg whose measured motion misses
+the commanded single DoF (typically y−/z− toward the table or the robot's own body) is
+retried with the opposite sign or a smaller magnitude. Only the ACCEPTED legs are then
+replayed and filmed (`calibration.render_clean`), so the clip never contains a failed,
+partial or off-axis motion. Before this, 90 % of clips contained 1–4 rejected attempts.
+
+**Rotations pivot at the gripper centre.** RoboTwin's end-effector point sits 0.12 m behind
+the gripper centre; rotating about it moves the gripper centre 3–4 cm per 20°, which in the
+recorded (gripper-centre) actions makes a roll leg look like a translation too. Legs and
+scripted counterfactual motions therefore rotate about the gripper centre (filmed drift
+≤ 5 mm).
+
 `move_range.json` records the exact out/back **frame spans** of every leg, so the SyncWorld
 segment extractor can read them instead of rediscovering "the strongest signed run" from
 pose deltas.
@@ -157,4 +169,4 @@ the measured divergence (overall and per arm), the attempt log, and whether the 
 * Per-video texture re-sampling (`--vary_textures`) — RoboTwin draws textures from the seed;
   across seeds the variety is already there.
 * The physical-event ground truth (`physical_state.npz`, seg videos, contacts) — only
-  per-frame object poses are recorded for now.
+  per-frame object poses and articulated-object joint positions are recorded for now.
