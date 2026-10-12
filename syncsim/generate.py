@@ -110,7 +110,7 @@ class Config:
     cf_escalation: float = 1.6
     cf_min_prefix_frames: int = 4
     cf_min_suffix_frames: int = 24
-    freeze_min_motion_rad: float = 0.05      # freeze_arm only freezes an arm that still moves this much
+    freeze_min_remaining_m: float = 0.08     # freeze_arm breakpoint: frozen TCP must still travel this far
     noise_sigma_rad: float = 0.12
     noise_wrist_scale: float = 0.6
     noise_interval_frames: int = 10          # ramp half-width
@@ -176,6 +176,29 @@ def _unit_rng(cfg, seed, m, tag):
     s = (seed * 1_000_003 + m * 97 + cfg.camera_seed_salt * 2_654_435_761
          + zlib.crc32(f"{cfg.task}:{tag}".encode())) & 0x7FFFFFFF
     return np.random.default_rng(s)
+
+
+def _freeze_frames(cfg, expert_tcp, arm):
+    """Expert frames at which freezing `arm` still matters: inside the prefix/suffix margins,
+    and the arm's TCP later gets at least `freeze_min_remaining_m` away from where it is."""
+    tcp = np.asarray(expert_tcp)[:, 0 if arm == "left" else 1]
+    n = len(tcp)
+    lo, hi = cfg.cf_min_prefix_frames, n - cfg.cf_min_suffix_frames
+    if hi <= lo:
+        lo, hi = 0, max(1, n // 2)
+    return [f for f in range(lo, hi)
+            if np.linalg.norm(tcp[f:] - tcp[f], axis=1).max() >= cfg.freeze_min_remaining_m]
+
+
+def _freeze_breakpoint(rng, cfg, expert_tcp, arm_pref):
+    """(arm, breakpoint step) for freeze_arm, preferring `arm_pref`; ValueError if neither arm
+    has a frame where freezing it diverges."""
+    order = [arm_pref] + [a for a in ("left", "right") if a != arm_pref]
+    for arm in order:
+        frames = _freeze_frames(cfg, expert_tcp, arm)
+        if frames:
+            return arm, int(rng.choice(frames)) * cfg.frame_stride
+    raise ValueError("freeze_arm: no arm moves enough after any admissible breakpoint")
 
 
 def _rig_json(rig, cfg):
@@ -422,26 +445,26 @@ class Generator:
             s, info = CF.gripper_flip(stream, arng, cfg, arm_sel, cfg.frame_stride)
             ro.run(s)
             meta["flip"] = info
+        elif mode == "freeze_arm":
+            # freezing an arm that never moves again is a no-op (click_bell: the bell is on one
+            # side, the other arm stays home; dump_bin_bigbin: late breakpoints after the last
+            # motion) -- the breakpoint is drawn only where the frozen arm's TCP still has to
+            # travel at least the divergence gate, and an arm with no such frame is swapped out
+            arm_sel, p = _freeze_breakpoint(arng, cfg, expert_tcp, arm_sel)
+            meta["arms"] = arm_sel
+            meta["breakpoint_step"] = int(p)
+            meta["breakpoint_frame"] = int(p // cfg.frame_stride)
+            meta["freeze_arm_moves_after_breakpoint"] = True
+            s, info = CF.freeze_arm(stream, p, arm_sel)
+            ro.run(s)
+            meta["freeze"] = info
         else:
             p = CF.sample_breakpoint(arng, stream.n, cfg.frame_stride,
                                      cfg.cf_min_prefix_frames, cfg.cf_min_suffix_frames)
             meta["breakpoint_step"] = int(p)
             meta["breakpoint_frame"] = int(p // cfg.frame_stride)
-            if mode == "freeze_arm":
-                # freezing an arm that never moves again is a no-op (click_bell: the bell is
-                # on one side, the other arm stays home) -- freeze one that still moves
-                moving = [a for a in ("left", "right")
-                          if np.ptp(stream[f"{a}_q"][p:], axis=0).max() > cfg.freeze_min_motion_rad]
-                if arm_sel not in moving and moving:
-                    arm_sel = moving[0] if len(moving) == 1 else str(arng.choice(moving))
-                    meta["arms"] = arm_sel
-                meta["freeze_arm_moves_after_breakpoint"] = arm_sel in moving
-                s, info = CF.freeze_arm(stream, p, arm_sel)
-                ro.run(s)
-                meta["freeze"] = info
-            else:
-                ro.run(stream.slice(0, p))
-                meta["scripted"] = CF.scripted_suffix(ro, arng, cfg, CF.arms_of(arm_sel), esc)
+            ro.run(stream.slice(0, p))
+            meta["scripted"] = CF.scripted_suffix(ro, arng, cfg, CF.arms_of(arm_sel), esc)
         executed = ro.stream()
         div = CF.divergence(expert_tcp, ro.rec.tcp_track(), expert_g, ro.rec.gripper_track())
         ok = (div.get("max_tcp_m", 0) >= cfg.cf_min_tcp_deviation_m
@@ -459,16 +482,20 @@ class Generator:
         arm_sel = CF.pick(rng, _parse_probs(cfg.cf_arm_probs))
         if mode in ("freeze_arm", "gripper_flip") and arm_sel == "both":
             arm_sel = "left" if rng.random() < 0.5 else "right"
+        if mode == "freeze_arm" and not any(_freeze_frames(cfg, expert_tcp, a)
+                                            for a in ("left", "right")):
+            mode = "noisy_replay"       # nothing left to freeze in this expert
         attempts = []
         final = None
         n_att = max(1, cfg.cf_max_attempts)
         for attempt in range(n_att + 1):
             if attempt == n_att:
-                if final is not None:
+                if final is not None and final[3]:
                     break
-                # every attempt raised (e.g. a planner error in a scripted suffix): fall back to
-                # a perturbation, which needs no planning, rather than losing the whole episode
-                mode, arm_sel = "noisy_replay", ("both" if arm_sel == "both" else arm_sel)
+                # every attempt raised (e.g. a planner error in a scripted suffix) or stayed
+                # below the divergence gate: fall back to a perturbation, which needs no
+                # planning and acts on the whole episode, rather than keep a near-expert copy
+                mode = "noisy_replay"
             # the planner-free fallback starts at normal strength, not the escalated one
             esc = 1.0 if attempt == n_att else cfg.cf_escalation ** attempt
             arng = np.random.default_rng(rng.integers(1 << 31) + attempt)
@@ -485,13 +512,14 @@ class Generator:
             attempts.append({"attempt": attempt, "mode": mode, "escalation": esc,
                              "accepted": bool(ok), "max_tcp_m": div.get("max_tcp_m"),
                              "gripper_mismatch_frac": div.get("gripper_mismatch_frac")})
-            final = res
+            if final is None or ok or div.get("max_tcp_m", 0) > final[2].get("max_tcp_m", 0):
+                final = res
             if ok:
                 break
         if final is None:
             raise RuntimeError(f"counterfactual {k}: every attempt failed: {attempts}")
         executed, meta, div, ok = final
-        # ---- render the accepted (or last) executed stream exactly ------------------------
+        # ---- render the accepted (or most divergent) executed stream exactly -------------
         self._reset(seed)
         rec = self._recorder(rig)
         ro = Rollout(self.task, rec, cfg.frame_stride, poll_success=True)
@@ -508,7 +536,7 @@ class Generator:
                      "divergence": dict(div, threshold_m=cfg.cf_min_tcp_deviation_m,
                                         accepted=bool(ok), attempt_log=attempts)})
         write_json(os.path.join(cf_dir, "metadata.json"), meta)
-        print(f"    [cf] seed {seed} unit {m} cf{k}: {mode}/{arm_sel} max_tcp "
+        print(f"    [cf] seed {seed} unit {m} cf{k}: {meta['counterfactual_mode']}/{meta['arms']} max_tcp "
               f"{div.get('max_tcp_m', 0):.3f} m gmis {div.get('gripper_mismatch_frac', 0):.2f} "
               f"success={success} attempts={len(attempts)}{'' if ok else ' (BELOW GATE)'}")
 
