@@ -1,0 +1,160 @@
+# SyncSim design notes — porting the robocasa generator to bimanual RoboTwin
+
+What each feature is for, how it maps from the single-arm robocasa generator
+(`robocasa-dev/datagen/`, see its `DESIGN.md`) to two arms on RoboTwin 2.0, and what to watch
+out for. `README.md` has usage; numbers quoted here are measured unless marked otherwise.
+
+---
+
+## 0. Why RoboTwin 2.0 (not RoboDojo)
+
+| | RoboTwin 2.0 | RoboDojo |
+|---|---|---|
+| released data **generation** code | yes — scripted experts for 50 bimanual tasks, seed search + replay | no — the repo is the evaluation client; the trajectory-synthesis pipeline is not released |
+| simulator | SAPIEN 3 (Vulkan; rasteriser or ray tracer) | Isaac Sim 5.1 / Isaac Lab 2.3 |
+| embodiments | aloha-agilex (dual-arm), and any pair of franka / piper / ARX-X5 / ur5-wsg as `[left, right, gap]` | ARX X5 in sim |
+| license | MIT | MIT |
+
+Counterfactual and calibration generation need to **re-execute modified controls from a
+seeded initial scene**, which needs the generation code, not just an evaluator. RoboTwin also
+lets one generator cover several bimanual embodiments (cross-embodiment is exactly what
+SyncWorld's calibration is for). RoboDojo's sim tasks are a good *evaluation* target later.
+
+---
+
+## 1. The one structural change: everything is a control-stream replay
+
+Robocasa rendered the expert by **replaying recorded MuJoCo states** and every other rollout
+by **stepping actions**, and that asymmetry leaked everywhere (a 1–2 cm replay floor, one
+control step of pose offset, a separate unrendered "action replay" just to measure
+divergence).
+
+RoboTwin's expert is a scripted planner whose motions all bottom out in three calls —
+`Robot.set_arm_joints`, `Robot.set_gripper`, `scene.step`. `rt_env.StreamRecorder` hooks
+them during the one planning run and flattens the targets in effect at every physics step
+into a **ControlStream** (`left_q/dq`, `right_q/dq`, `left_g`, `right_g`, gripper rate
+limits). Then:
+
+* the **expert** video is the stream replayed from `setup_demo(seed)`;
+* **counterfactuals** are edited streams (or a stream prefix + live-planned suffix);
+* **calibration** is a live-planned stream.
+
+All go through `Rollout.run`, so the expert is the divergence reference itself and there is
+no state/action floor. Two guards: the expert stream is re-validated with `check_success()`
+after its rendered replay (unit dropped otherwise), and RoboTwin's own joint-limit legality
+check (`planned_joints_legal`) is kept.
+
+**Determinism.** The rendered pass of a counterfactual is the replay of the stream its
+*unrendered probe* executed — identical commands from an identical seeded scene. Live planning
+never happens in a rendered pass.
+
+---
+
+## 2. Third-person cameras
+
+Robocasa: orbit around the EE, gate on gripper segmentation pixels at N check frames, ≥45°
+baseline angle between simultaneous views, 150-attempt resampling with a state restore per
+candidate.
+
+SyncSim (`cameras.py`):
+
+* **Aim target** = centroid of *both* TCPs over the check frames (robocasa: one EE).
+* **Sampling**: azimuth ±`AZIMUTH_RANGE_DEG` around the embodiment's own head-camera
+  direction, explicit elevation band, true 3D radius (robocasa learned the hard way that a
+  horizontal radius silently inflates distance), small aim/roll jitter.
+* **Geometric pre-rejection** (free): inside the back wall (RoboTwin's wall face is at
+  y = 0.4), under the table top over its footprint, under the floor.
+* **Gate in one replay**: every candidate is rendered by a small *rasterised* segmentation
+  camera at each check frame of a single unrendered expert replay, and candidates are
+  eliminated as they fail. Cost = (#candidates × #check frames) tiny renders + one physics
+  replay; no state save/restore API needed.
+* **Which hands must be visible** (`GATE_ARMS`): `both` (default — a bimanual world model must
+  see both hands to learn which action dims move which arm), `active` (arms that move in
+  the expert), `any`.
+* **Multi-view** selection is greedy in sampling order with the baseline-angle constraint.
+
+No base-motion filter and no camera-drift filter: RoboTwin robots are fixed-base and the
+cameras are world-static, so both robocasa failure modes cannot occur.
+
+## 3. Wrist cameras
+
+Two wrist cameras (one per arm) on RoboTwin's `left_camera` / `right_camera` links, each with a
+jittered mount (±1 cm, ±5°) chosen by the robocasa **two-sided** gate on the fraction of the
+wrist image covered by that arm's own gripper; falls back to the stock mount (recorded as
+`stock_mount: true`).
+
+---
+
+## 4. Calibration (bimanual)
+
+Per arm, each of its 6 EE DoFs (x, y, z, roll, pitch, yaw — world-frame translations,
+rotations about world axes through the gripper centre) goes **out → hold → back → hold** while
+the other arm and both grippers hold still: **24 single-DoF legs** in total (2 arms × 6 DoF ×
+out/back). Arm order random; within an arm translations (shuffled) then rotations
+(shuffled), random sign — the paper's / robocasa's randomisation.
+
+Robocasa commanded per-step OSC deltas, so magnitude = speed. RoboTwin is joint-position
+controlled, so each leg is **planned with curobo** from the current state and **re-timed to a
+constant speed** (`motion.retime`); magnitude (distance) and speed are independent knobs.
+Unreachable legs retry at 60 % and 35 % of the magnitude, else are recorded as skipped.
+
+`move_range.json` records the exact out/back **frame spans** of every leg, so the SyncWorld
+segment extractor can read them instead of rediscovering "the strongest signed run" from
+pose deltas.
+
+---
+
+## 5. Counterfactuals
+
+| mode | what | robocasa analogue |
+|---|---|---|
+| `noisy_replay` | expert stream + smooth sparse **joint-space** offsets on left / right / both arms; offsets **persist** after their ramp (`noise_persist`) | `noisy_replay` (OSC deltas integrate, so robocasa offsets persisted too) |
+| `scripted_diverge` | expert prefix → 1–2 scripted EE motions planned live for the chosen arm(s); unchosen arm + grippers **hold** | `scripted_diverge` with the opt-in `hold` gripper mode |
+| `freeze_arm` | from a breakpoint one arm holds while the other keeps executing the expert | new — bimanual only: breaks coordination (handover never happens) with natural motion |
+| `gripper_flip` | one arm's gripper command inverted from a sampled step to the end | `--cf_gripper_flip_prob` |
+
+Robocasa lessons applied:
+
+* **Make sure a perturbation acts.** Robocasa's legacy perturbation hit only the sign-read
+  gripper dim and was a no-op. Here every counterfactual is probed unrendered, measured
+  against the expert (max TCP deviation per arm, gripper-command mismatch), and re-rolled
+  with ×1.6 magnitude below 5 cm unless the gripper differs on ≥5 % of frames.
+* **Reserve a suffix.** Breakpoints keep ≥ `CF_MIN_SUFFIX_FRAMES` after them (robocasa's
+  `scripted_diverge` had a 7 % near-expert tail from late breakpoints).
+* **Mix the task into seeds** (robocasa's `cf_task_seed_salt` fix): all RNG streams include
+  the task name, seed, camera unit and a per-set salt.
+
+Each counterfactual's `metadata.json` records mode, arms, breakpoint, the edit parameters,
+the measured divergence (overall and per arm), the attempt log, and whether the task still
+**succeeded** — a free label for outcome prediction.
+
+---
+
+## 6. Output and conventions
+
+* Layout `set_<id>/<task>/episode_<seed>/camera_poses_<m>/...` mirrors robocasa, with
+  `wrist_left_rgb/` + `wrist_right_rgb/` instead of `wrist_rgb/`. Episodes are named by
+  **seed** (RoboTwin skips failing seeds; a seed is the stable identity).
+* `actions.npy` `[T,16]`: per arm TCP xyz + quat **xyzw** + commanded gripper opening — the
+  bimanual version of SyncWorld's 8-dim per-frame pose conditioning.
+* `pose.pkl` keys extend robocasa's (`left_/right_gripper_pose|matrix|open`).
+* Frame rate: physics 250 Hz, `FRAME_STRIDE=12` → 20.8 fps (robocasa 20 Hz).
+* Every control stream is saved (`expert_stream.npz`, `*/stream.npz`), so any rollout can be
+  re-rendered from a new viewpoint without re-planning.
+
+## 7. Cluster-specific gotchas
+
+* Blackwell GPUs need torch built for CUDA 12.8 and curobo compiled for sm_100/sm_120.
+* RoboTwin's ray-tracing denoiser `oidn` fails on Blackwell ("OIDN Error: invalid handle");
+  SyncSim switches to `optix` after every scene setup.
+* The login node has no AVX (open3d → "Illegal instruction") and kills large `cicc` compiles:
+  import/run/compile on compute nodes.
+* SAPIEN's `rt` shader needs RT cores: use `rtx-batch`, not the B200 partitions.
+
+## 8. Not ported (yet)
+
+* Rig-paired episodes (`PAIR_SIZE`) — needs a per-pair rig validated across seeds.
+* Per-video texture re-sampling (`--vary_textures`) — RoboTwin draws textures from the seed;
+  across seeds the variety is already there.
+* The physical-event ground truth (`physical_state.npz`, seg videos, contacts) — only
+  per-frame object poses are recorded for now.
