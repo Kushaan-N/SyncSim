@@ -402,6 +402,52 @@ class Generator:
         })
 
     # ------------------------------------------------------------------------------------
+    def _cf_attempt(self, seed, mode, arm_sel, esc, arng, stream, expert_tcp, expert_g, attempt):
+        """One unrendered probe of a counterfactual -> (executed stream, meta, divergence, ok)."""
+        cfg = self.cfg
+        from . import counterfactual as CF
+        from .rollout import Rollout
+        self._reset(seed)
+        dt = self.task.scene.get_timestep()
+        ro = Rollout(self.task, _TrackOnly(self.task), cfg.frame_stride, render=False,
+                     poll_success=True)
+        meta = {"counterfactual_mode": mode, "arms": arm_sel, "attempt": attempt,
+                "escalation": esc}
+        if mode == "noisy_replay":
+            s, info = CF.noisy_replay(stream, arng, cfg, CF.arms_of(arm_sel), esc,
+                                      cfg.frame_stride, dt)
+            ro.run(s)
+            meta["noise"] = info
+        elif mode == "gripper_flip":
+            s, info = CF.gripper_flip(stream, arng, cfg, arm_sel, cfg.frame_stride)
+            ro.run(s)
+            meta["flip"] = info
+        else:
+            p = CF.sample_breakpoint(arng, stream.n, cfg.frame_stride,
+                                     cfg.cf_min_prefix_frames, cfg.cf_min_suffix_frames)
+            meta["breakpoint_step"] = int(p)
+            meta["breakpoint_frame"] = int(p // cfg.frame_stride)
+            if mode == "freeze_arm":
+                # freezing an arm that never moves again is a no-op (click_bell: the bell is
+                # on one side, the other arm stays home) -- freeze one that still moves
+                moving = [a for a in ("left", "right")
+                          if np.ptp(stream[f"{a}_q"][p:], axis=0).max() > cfg.freeze_min_motion_rad]
+                if arm_sel not in moving and moving:
+                    arm_sel = moving[0] if len(moving) == 1 else str(arng.choice(moving))
+                    meta["arms"] = arm_sel
+                meta["freeze_arm_moves_after_breakpoint"] = arm_sel in moving
+                s, info = CF.freeze_arm(stream, p, arm_sel)
+                ro.run(s)
+                meta["freeze"] = info
+            else:
+                ro.run(stream.slice(0, p))
+                meta["scripted"] = CF.scripted_suffix(ro, arng, cfg, CF.arms_of(arm_sel), esc)
+        executed = ro.stream()
+        div = CF.divergence(expert_tcp, ro.rec.tcp_track(), expert_g, ro.rec.gripper_track())
+        ok = (div.get("max_tcp_m", 0) >= cfg.cf_min_tcp_deviation_m
+              or div.get("gripper_mismatch_frac", 0) >= cfg.cf_min_gripper_mismatch_frac)
+        return executed, meta, div, ok
+
     def counterfactual(self, seed, m, k, unit, rig, stream, expert_tcp, expert_g):
         cfg = self.cfg
         from . import counterfactual as CF
@@ -415,54 +461,34 @@ class Generator:
             arm_sel = "left" if rng.random() < 0.5 else "right"
         attempts = []
         final = None
-        for attempt in range(max(1, cfg.cf_max_attempts)):
-            esc = cfg.cf_escalation ** attempt
+        n_att = max(1, cfg.cf_max_attempts)
+        for attempt in range(n_att + 1):
+            if attempt == n_att:
+                if final is not None:
+                    break
+                # every attempt raised (e.g. a planner error in a scripted suffix): fall back to
+                # a perturbation, which needs no planning, rather than losing the whole episode
+                mode, arm_sel = "noisy_replay", ("both" if arm_sel == "both" else arm_sel)
+            esc = cfg.cf_escalation ** min(attempt, n_att - 1)
             arng = np.random.default_rng(rng.integers(1 << 31) + attempt)
-            self._reset(seed)
-            dt = self.task.scene.get_timestep()
-            ro = Rollout(self.task, _TrackOnly(self.task), cfg.frame_stride, render=False,
-                         poll_success=True)
-            meta = {"counterfactual_mode": mode, "arms": arm_sel, "attempt": attempt,
-                    "escalation": esc}
-            if mode == "noisy_replay":
-                s, info = CF.noisy_replay(stream, arng, cfg, CF.arms_of(arm_sel), esc,
-                                          cfg.frame_stride, dt)
-                ro.run(s)
-                meta["noise"] = info
-            elif mode == "gripper_flip":
-                s, info = CF.gripper_flip(stream, arng, cfg, arm_sel, cfg.frame_stride)
-                ro.run(s)
-                meta["flip"] = info
-            else:
-                p = CF.sample_breakpoint(arng, stream.n, cfg.frame_stride,
-                                         cfg.cf_min_prefix_frames, cfg.cf_min_suffix_frames)
-                meta["breakpoint_step"] = int(p)
-                meta["breakpoint_frame"] = int(p // cfg.frame_stride)
-                if mode == "freeze_arm":
-                    # freezing an arm that never moves again is a no-op (click_bell: the
-                    # bell is on one side, the other arm stays home) -- freeze one that moves
-                    moving = [a for a in ("left", "right")
-                              if np.ptp(stream[f"{a}_q"][p:], axis=0).max() > cfg.freeze_min_motion_rad]
-                    if arm_sel not in moving and moving:
-                        arm_sel = moving[0] if len(moving) == 1 else arng.choice(moving)
-                        meta["arms"] = arm_sel
-                    meta["freeze_arm_moves_after_breakpoint"] = arm_sel in moving
-                    s, info = CF.freeze_arm(stream, p, arm_sel)
-                    ro.run(s)
-                    meta["freeze"] = info
-                else:
-                    ro.run(stream.slice(0, p))
-                    meta["scripted"] = CF.scripted_suffix(ro, arng, cfg, CF.arms_of(arm_sel), esc)
-            executed = ro.stream()
-            div = CF.divergence(expert_tcp, ro.rec.tcp_track(), expert_g, ro.rec.gripper_track())
-            ok = (div.get("max_tcp_m", 0) >= cfg.cf_min_tcp_deviation_m
-                  or div.get("gripper_mismatch_frac", 0) >= cfg.cf_min_gripper_mismatch_frac)
-            attempts.append({"attempt": attempt, "escalation": esc, "accepted": bool(ok),
-                             "max_tcp_m": div.get("max_tcp_m"),
+            try:
+                res = self._cf_attempt(seed, mode, arm_sel, esc, arng, stream, expert_tcp,
+                                       expert_g, attempt)
+            except Exception as e:
+                traceback.print_exc()
+                attempts.append({"attempt": attempt, "mode": mode,
+                                 "error": f"{type(e).__name__}: {e}"[:200]})
+                continue
+            executed, meta, div, ok = res
+            arm_sel = meta["arms"]
+            attempts.append({"attempt": attempt, "mode": mode, "escalation": esc,
+                             "accepted": bool(ok), "max_tcp_m": div.get("max_tcp_m"),
                              "gripper_mismatch_frac": div.get("gripper_mismatch_frac")})
-            final = (executed, meta, div, ok)
+            final = res
             if ok:
                 break
+        if final is None:
+            raise RuntimeError(f"counterfactual {k}: every attempt failed: {attempts}")
         executed, meta, div, ok = final
         # ---- render the accepted (or last) executed stream exactly ------------------------
         self._reset(seed)
