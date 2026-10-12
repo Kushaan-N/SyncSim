@@ -218,6 +218,28 @@ class SegCam:
         self.cam.take_picture()
         return self.cam.get_picture("Segmentation")[..., 1].astype(np.int64)
 
+    def gray(self):
+        """Grey image of the last picture (call after `seg`)."""
+        return np.clip(self.cam.get_picture("Color")[..., :3], 0, 1).mean(-1)
+
+
+def _blocks(g, k=16):
+    h = g.shape[0] // k * k
+    return g[:h, :h].reshape(k, h // k, k, h // k).mean((1, 3))
+
+
+def rt_view_ok(raster_gray, rt_gray, min_std, min_corr):
+    """A wrist view must look the same to the ray tracer as to the rasteriser. Inside a mesh
+    (lens pushed into the wrist housing) the rasteriser culls the back faces and sees out,
+    while the ray tracer renders the inside: a flat dark/grey frame uncorrelated with the
+    raster one. Returns (ok, rt_std, corr)."""
+    a, b = _blocks(raster_gray).ravel(), _blocks(rt_gray).ravel()
+    sd = float(rt_gray.std() * 255)
+    if sd < min_std or a.std() < 1e-6 or b.std() < 1e-6:
+        return False, sd, 0.0
+    c = float(np.corrcoef(a, b)[0, 1])
+    return c >= min_corr, sd, c
+
 
 def gate_and_select(task, reset_fn, stream, cfg, rng, args, n_views, frame_stride):
     """`reset_fn()` must put `task` back at the seeded initial scene (it is called twice:
@@ -267,10 +289,14 @@ def gate_and_select(task, reset_fn, stream, cfg, rng, args, n_views, frame_strid
     reset_fn()
     segcam = SegCam(task.scene, cfg.gate_size, cfg.fovy_deg)
     wseg = SegCam(task.scene, cfg.gate_size, cfg.wrist_fovy_deg, name="syncsim_gate_wrist")
+    wrt = add_camera(task.scene, "syncsim_gate_wrist_rt", cfg.gate_size, cfg.gate_size,
+                     cfg.wrist_fovy_deg, shader="rt") if cfg.wrist_rt_check else None
     px_min = cfg.min_gripper_px_frac * cfg.gate_size * cfg.gate_size
     alive = list(range(len(cands)))
     px_log = {i: [] for i in range(len(cands))}
     wfrac = {a: {i: [] for i in range(len(wrist_cands[a]))} for a in ("left", "right")}
+    wrt_ok = {a: {i: True for i in range(len(wrist_cands[a]))} for a in ("left", "right")}
+    wrt_log = {a: {i: [] for i in range(len(wrist_cands[a]))} for a in ("left", "right")}
 
     def at_frame(fi, si):
         nonlocal alive
@@ -294,6 +320,18 @@ def gate_and_select(task, reset_fn, stream, cfg, rng, args, n_views, frame_strid
             for j, jm in enumerate(wrist_cands[a]):
                 s = wseg.seg(sc, link_mat @ jm)
                 wfrac[a][j].append(float(np.isin(s, list(grip_ids[a])).mean()))
+                # lens-in-housing is fixed relative to the link, so it shows from the first
+                # check frame on; later frames are close-ups of objects (reflective bowls,
+                # transparent cups) where the two renderers legitimately disagree
+                if wrt is not None and fi == check[0]:
+                    wrt.entity.set_pose(sapien.Pose(link_mat @ jm))
+                    sc.update_render()
+                    wrt.take_picture()
+                    rg = np.clip(wrt.get_picture("Color")[..., :3], 0, 1).mean(-1)
+                    ok, sd, c = rt_view_ok(wseg.gray(), rg, cfg.wrist_rt_min_std,
+                                           cfg.wrist_rt_min_corr)
+                    wrt_log[a][j].append([round(sd, 1), round(c, 3)])
+                    wrt_ok[a][j] = ok
 
     replay_stream(task, stream, frame_stride, on_frame=at_frame)
 
@@ -315,11 +353,13 @@ def gate_and_select(task, reset_fn, stream, cfg, rng, args, n_views, frame_strid
     for a in ("left", "right"):
         def passes(j):
             fr = wfrac[a][j]
-            return bool(fr) and min(fr) >= cfg.wrist_min_frac and max(fr) <= cfg.wrist_max_frac
+            return (bool(fr) and min(fr) >= cfg.wrist_min_frac and max(fr) <= cfg.wrist_max_frac
+                    and wrt_ok[a][j])
         # first jittered mount that passes; else the stock mount (flagged by `stock`)
         pick = next((j for j in range(1, len(wrist_cands[a])) if passes(j)), 0)
         wrist[a] = {"rel_mat": wrist_cands[a][pick], "candidate": pick,
-                    "grip_frac": wfrac[a][pick], "stock": pick == 0}
+                    "grip_frac": wfrac[a][pick], "stock": pick == 0,
+                    "rt_check": wrt_log[a][pick], "rt_ok": wrt_ok[a][pick]}
     return {"ok": True, "views": views, "wrist": wrist, "target": target,
             "check_frames": check, "gate_arms": cfg.gate_arms, "need_arms": need,
             "arms_move": moves, "alive": len(alive), "candidates": len(cands),
