@@ -177,6 +177,10 @@ def sample_wrist_jitters(rng, n, pos_jitter, rot_jitter_deg):
         e = np.radians(rng.uniform(-rot_jitter_deg, rot_jitter_deg, size=3))
         m[:3, :3] = t3d.euler.euler2mat(*e)
         m[:3, 3] = rng.uniform(-pos_jitter, pos_jitter, size=3)
+        # never back along the optical axis (camera x): that pushes the lens into the wrist
+        # housing, which the rasterised gate sees through (back faces culled) but the ray
+        # tracer renders as a dark/grey wall for the whole episode
+        m[0, 3] = abs(m[0, 3])
         out.append(m)
     return out
 
