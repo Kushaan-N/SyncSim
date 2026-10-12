@@ -9,7 +9,8 @@ ERROR instead of having to be spotted by eye. Per camera unit:
 structure   every rollout has pose.pkl / actions.npy / joints.npy / object_poses.npz /
             metadata, every video has exactly len(pose.pkl) frames, actions == pose.pkl
 videos      sampled frames are not blank (mean / std bounds)
-rig         simultaneous views are >= min_separation_deg apart; wrist mounts recorded
+rig         simultaneous views are >= min_separation_deg apart; wrist mounts recorded and
+            their ray-traced view matched the rasterised one in the gate
 calibration each filmed leg moves ONLY the commanded DoF of ONLY the commanded arm, by
             roughly the commanded amount; translation legs do not rotate, rotation legs do
             not translate the gripper centre; the arm returns to where the leg started;
@@ -163,6 +164,14 @@ def check_rig(u, rep):
     for arm in ("left", "right"):
         if arm not in v.get("wrist", {}):
             rep.err(u, f"wrist mount missing: {arm}")
+            continue
+        # the ray-traced wrist view must have matched the rasterised one in the gate (a lens
+        # inside the wrist housing renders a dark / grey wall only the ray tracer shows)
+        ok = v["wrist"][arm].get("gate_rt_ok")
+        if ok is None:
+            rep.warn(u, f"wrist mount {arm}: no ray-traced gate record (generated before the check)")
+        elif not ok:
+            rep.err(u, f"wrist mount {arm}: ray-traced view failed the gate {v['wrist'][arm].get('gate_rt_check')}")
     return v
 
 
