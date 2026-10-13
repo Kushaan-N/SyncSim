@@ -303,10 +303,15 @@ def main():
     ap.add_argument("--max_units", type=int, default=0)
     ap.add_argument("--no_videos", action="store_true", help="skip decoding videos (fast)")
     ap.add_argument("--show", type=int, default=40, help="max error lines to print")
+    ap.add_argument("--tasks", default="", help="comma-separated task names (default: all)")
+    ap.add_argument("--json_out", default="", help="also write the findings here as JSON")
     a = ap.parse_args()
 
     units = sorted(glob.glob(os.path.join(a.set_dir, "*", "episode_*", "camera_poses_*")))
     units = [u for u in units if os.path.exists(os.path.join(u, "_DONE"))]
+    if a.tasks:
+        keep = set(a.tasks.split(","))
+        units = [u for u in units if u.split(os.sep)[-3] in keep]
     if a.max_units:
         units = units[:a.max_units]
     rep = Report()
@@ -316,32 +321,48 @@ def main():
         task = u.split(os.sep)[-3]
         st = per_task[task]
         st["units"] += 1
-        check_rig(u, rep)
-        exp = check_rollout(os.path.join(u, "expert"), rep, not a.no_videos)
-        if exp is None:
-            continue
-        st["expert_T"].append(len(exp["left_gripper_pose"]))
-        em = json.load(open(os.path.join(u, "expert", "metadata.json")))
-        if not em.get("success"):
-            rep.err(u, "expert not successful")
-        cal = os.path.join(u, "calibration")
-        if os.path.isdir(cal):
-            cp = check_rollout(cal, rep, not a.no_videos)
-            if cp is not None:
-                mr = check_calibration(cal, cp, rep)
-                st["legs"] += len(mr["legs"])
-                st["skipped"] += len(mr.get("skipped", []))
-        for cf in sorted(glob.glob(os.path.join(u, "counterfactual_*"))):
-            p = check_rollout(cf, rep, not a.no_videos)
-            if p is None:
-                continue
-            md = check_counterfactual(cf, p, exp, rep)
-            div = md["divergence"]
-            by_mode[md["counterfactual_mode"]].append(
-                (div.get("max_tcp_m", 0.0), bool(div.get("accepted")), bool(md.get("task_success"))))
-        if a.montage_dir:
-            montage(u, a.montage_dir)
+        try:
+            check_unit(u, st, by_mode, rep, a)
+        except Exception as e:      # a truncated / corrupt file must be a finding, not a crash
+            rep.err(u, f"unreadable unit: {type(e).__name__}: {e}"[:300])
 
+    _print_summary(units, per_task, by_mode, rep, a)
+    if a.json_out:
+        with open(a.json_out, "w") as f:
+            json.dump({"units": len(units), "errors": rep.errors, "warnings": rep.warns,
+                       "counts": dict(rep.counts)}, f, indent=1)
+    sys.exit(1 if rep.errors else 0)
+
+
+def check_unit(u, st, by_mode, rep, a):
+    check_rig(u, rep)
+    exp = check_rollout(os.path.join(u, "expert"), rep, not a.no_videos)
+    if exp is None:
+        return
+    st["expert_T"].append(len(exp["left_gripper_pose"]))
+    em = json.load(open(os.path.join(u, "expert", "metadata.json")))
+    if not em.get("success"):
+        rep.err(u, "expert not successful")
+    cal = os.path.join(u, "calibration")
+    if os.path.isdir(cal):
+        cp = check_rollout(cal, rep, not a.no_videos)
+        if cp is not None:
+            mr = check_calibration(cal, cp, rep)
+            st["legs"] += len(mr["legs"])
+            st["skipped"] += len(mr.get("skipped", []))
+    for cf in sorted(glob.glob(os.path.join(u, "counterfactual_*"))):
+        p = check_rollout(cf, rep, not a.no_videos)
+        if p is None:
+            continue
+        md = check_counterfactual(cf, p, exp, rep)
+        div = md["divergence"]
+        by_mode[md["counterfactual_mode"]].append(
+            (div.get("max_tcp_m", 0.0), bool(div.get("accepted")), bool(md.get("task_success"))))
+    if a.montage_dir:
+        montage(u, a.montage_dir)
+
+
+def _print_summary(units, per_task, by_mode, rep, a):
     print(f"units checked: {len(units)}")
     print(f"{'task':28s} {'units':>5s} {'expert T':>8s} {'calib skipped':>13s}")
     for t, st in sorted(per_task.items()):
@@ -358,7 +379,6 @@ def main():
     for e in rep.errors[:a.show]:
         print("ERROR " + e)
     print(f"\n{len(rep.errors)} error(s), {len(rep.warns)} warning(s)")
-    sys.exit(1 if rep.errors else 0)
 
 
 def montage(unit, out_dir):
