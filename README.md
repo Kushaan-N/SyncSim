@@ -82,6 +82,30 @@ divergence per mode, task success rates; `--montage_dir` saves frame grids of ev
 python scripts/verify_set.py --set_dir data/set_0 --montage_dir montage/
 ```
 
+While a run is in progress, validate each task as soon as it finishes (verdicts go to
+`<data>/_validate.log`), and summarise a whole data root (yield per task, camera spread,
+calibration coverage, counterfactual divergence and success rates):
+
+```bash
+DATA_ROOT=data nohup bash scripts/watch_validate.sh &
+python scripts/dataset_stats.py --root data --json_out stats.json
+```
+
+## Training with SyncWorld
+
+SyncWorld's gripperhead loader reads the layout below directly.
+
+* **Bimanual** (14-D action, 7 per arm; calibration segmented per arm): point the loader at
+  the data root with `arms = "both"` and `calib_segments = 12` (6 positive sweeps per arm) or
+  `24` (both directions), in a SyncWorld build that has the `arms` option.
+* **Single-arm**, for the stock loader: export one arm's view of a set (videos are symlinked,
+  nothing is copied). The action then covers only that arm while both move in the video, so
+  this is for pipeline testing, not training.
+
+```bash
+python scripts/export_singlearm.py --set_dir data/set_0 --out_root export/set_0
+```
+
 ## Output
 
 ```
@@ -119,4 +143,4 @@ third-person views, four counterfactuals per episode.
 | `syncsim/counterfactual.py` | counterfactual modes and divergence measurement |
 | `syncsim/motion.py` | straight-line end-effector motion planning |
 | `syncsim/recorder.py`, `syncsim/rollout.py` | rendering, file output, stepping |
-| `scripts/` | batch generation, SLURM submission, offline verification |
+| `scripts/` | batch generation, SLURM submission, offline verification and statistics, SyncWorld export |
