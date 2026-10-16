@@ -386,6 +386,9 @@ class Generator:
                 shutil.rmtree(backup)
             shutil.move(cf_dir, backup)
             try:
+                # set the seeded scene up first: the speed limit reads the physics timestep
+                # (`self.fps`) before the first probe resets the task
+                self._reset(seed)
                 self.counterfactual(seed, m, k, unit, rig, stream, expert_tcp, expert_g,
                                     expert_quat)
                 md_path = os.path.join(cf_dir, "metadata.json")
