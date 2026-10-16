@@ -87,13 +87,16 @@ python scripts/verify_set.py --set_dir data/set_0 --montage_dir montage/
 
 To repair a set, list every bad rollout (`--dark_scan` also decodes every wrist video to
 catch views that go dark mid-episode), then regenerate the listed counterfactuals in place
-on a GPU node. The originals are backed up under `<data>/_redo_backup/`; units whose
-problem is not a counterfactual stay in the list, which doubles as a training exclude list.
+on a GPU node (the originals are backed up under `<data>/_redo_backup/`). Validate again,
+and move whatever still fails (e.g. a unit whose wrist mount failed, which a redo cannot fix)
+out of the dataset tree into `<data>/_quarantine/`; `--restore` moves it back.
 
 ```bash
 python scripts/verify_set.py --set_dir data/set_0 --dark_scan --exclude_out bad.tsv
 LIST=bad.tsv DRY_RUN=1 bash scripts/redo_cf.sh      # show what would be regenerated
 LIST=bad.tsv bash scripts/redo_cf.sh
+python scripts/verify_set.py --set_dir data/set_0 --dark_scan --exclude_out still_bad.tsv
+python scripts/quarantine.py --list still_bad.tsv
 ```
 
 While a run is in progress, validate each task as soon as it finishes (verdicts go to
