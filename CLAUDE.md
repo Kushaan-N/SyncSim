@@ -17,15 +17,21 @@ wrist cameras. It is the two-arm port of the single-arm RoboCasa generator in
 ```
 syncsim/rt_env.py         RoboTwin bridge: task args, setup, ControlStream record/replay, expert
 syncsim/cameras.py        3rd-person rig sampling + one-replay segmentation gate, wrist jitter
-syncsim/motion.py         live planned EE displacements (curobo) re-timed to a fixed speed
+syncsim/motion.py         straight-line EE displacements (mplib screw, else short curobo hops), re-timed
 syncsim/calibration.py    bimanual 6-DoF-per-arm sweep with exact per-leg frame spans
-syncsim/counterfactual.py noisy_replay / scripted_diverge / freeze_arm / gripper_flip + divergence
+syncsim/counterfactual.py noisy_replay / scripted_diverge / freeze_arm / gripper_flip, divergence + speed
 syncsim/recorder.py       cameras -> mp4s, pose.pkl / actions.npy / joints.npy / object_poses.npz
 syncsim/rollout.py        steps a stream (or live segments) and captures every frame_stride steps
-syncsim/generate.py       per-task driver + Config (every knob) -> `python -m syncsim.generate`
+syncsim/generate.py       per-task driver + Config (every knob) -> `python -m syncsim.generate`;
+                          `--redo_list` regenerates listed counterfactuals in place
 scripts/gen_set.sh        SINGLE SOURCE OF RUN DEFAULTS (env vars) for one seed shard ("set")
 scripts/submit_slurm.sh   2-D SLURM array (set x task partition) -> scripts/gen.sbatch
-scripts/verify_set.py     audit a generated set without re-simulating
+scripts/gen.sbatch        one array task: runs gen_set.sh for its (set, task partition)
+scripts/verify_set.py     audit a generated set without re-simulating; --exclude_out, --dark_scan
+scripts/watch_validate.sh validate each task as soon as it finishes (-> <data>/_validate.log)
+scripts/dataset_stats.py  yield / camera / calibration / counterfactual stats for a data root
+scripts/export_singlearm.py one-arm export for SyncWorld's stock (single-arm) loader
+scripts/redo_cf.sh        regenerate the counterfactuals in a verify_set exclude list
 ```
 
 ## Environment (AICR cluster)
@@ -47,6 +53,8 @@ scripts/verify_set.py     audit a generated set without re-simulating
 - **Every rollout is a ControlStream replay from the seeded initial scene.** Expert,
   calibration and counterfactuals go through `Rollout.run`; the expert is NOT a state replay,
   so it is the divergence reference itself (no robocasa-style 1-2 cm replay floor).
+- A counterfactual is kept only if it diverges AND is physically plausible (peak TCP speed);
+  never relax the plausibility gate to make a mode "succeed" — fix the planning instead.
 - Counterfactuals are decided on an **unrendered probe** and then the *executed* stream is
   replayed with rendering — identical commands, deterministic physics, so the rendered
   rollout is the probed one. Keep live planning out of the rendered pass.
