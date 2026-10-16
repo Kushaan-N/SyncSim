@@ -24,7 +24,17 @@ counterfact divergence recomputed from pose.pkl equals metadata (render == probe
                           (being shoved by the other arm is reported, not failed)
               gripper_flip: identical before the flip, flipped gripper differs after it
               noisy_replay: identical to the expert before the first perturbation ramp
+              scripted_diverge: every arm the mode chose got a scripted motion
+motion      no end effector moves implausibly fast: a counterfactual's peak TCP speed must
+            stay <= max(MAX_TCP_SPEED, EXPERT_SPEED_MARGIN x the expert's peak); calibration
+            <= MAX_TCP_SPEED; an expert above it is reported (it is RoboTwin's own motion)
+dark scan   (--dark_scan) every --dark_stride-th frame of every WRIST video is decoded; a
+            video with more than DARK_FRAC_MAX of its frames darker than DARK_MEAN fails
+            (a lens that slips into the wrist housing only shows mid-episode)
 objects     object_poses.npz covers every frame; articulated objects have joint tracks
+
+--exclude_out writes one line per rollout / unit with an ERROR (path TAB first reason),
+the input for `generate.py --redo_list` (counterfactual dirs) or a training exclude list.
 
 Exit status 1 when any ERROR is found. WARN lines are reported but do not fail.
 """
@@ -53,6 +63,10 @@ STILL_STEP_M = 0.0025        # max per-frame TCP motion outside legs ("nothing m
 STILL_STEP_DEG = 0.6
 SETTLE_FRAMES = 3            # frames after a leg / breakpoint allowed for the arm to settle
 FREEZE_DRIFT_M = 0.012       # frozen arm motion allowed after the breakpoint (+settle)
+MAX_TCP_SPEED = 1.0          # m/s; the expert's p99 peak is ~0.6 m/s
+EXPERT_SPEED_MARGIN = 1.5
+DARK_MEAN = 20.0             # 0-255 frame mean counted as "dark"
+DARK_FRAC_MAX = 0.05
 
 
 class Report:
@@ -60,9 +74,11 @@ class Report:
     def __init__(self):
         self.errors, self.warns = [], []
         self.counts = Counter()
+        self.bad = {}                    # where -> first error message
 
     def err(self, where, msg):
         self.errors.append(f"{where}: {msg}")
+        self.bad.setdefault(where, msg)
         self.counts["ERROR:" + msg.split(":")[0][:60]] += 1
 
     def warn(self, where, msg):
@@ -87,6 +103,33 @@ def quat_xyzw(pose, arm):
 def ang_deg(qa, qb):
     d = np.abs(np.sum(np.asarray(qa) * np.asarray(qb), axis=-1))
     return np.degrees(2 * np.arccos(np.clip(d, -1, 1)))
+
+
+def peak_speed(pose):
+    """Peak TCP speed over both arms (m/s)."""
+    P = tcp(pose)
+    if len(P) < 2:
+        return 0.0
+    return float(np.linalg.norm(np.diff(P, axis=0), axis=2).max() * float(pose["fps"]))
+
+
+def dark_fraction(path, stride):
+    import imageio.v2 as iio
+    r = iio.get_reader(path)
+    try:
+        means = [float(fr[::4, ::4].mean()) for i, fr in enumerate(r) if i % stride == 0]
+    finally:
+        r.close()
+    return (float(np.mean(np.asarray(means) < DARK_MEAN)) if means else 0.0,
+            float(min(means)) if means else 0.0)
+
+
+def check_dark(d, rep, stride):
+    for v in sorted(glob.glob(os.path.join(d, "wrist_*_rgb", "video.mp4"))):
+        frac, low = dark_fraction(v, stride)
+        if frac > DARK_FRAC_MAX:
+            rep.err(d, f"dark wrist video: {os.path.relpath(v, d)} {100 * frac:.0f}% of frames "
+                       f"darker than {DARK_MEAN:.0f} (min mean {low:.1f})")
 
 
 def video_info(path, sample=(0, 0.5, -1)):
@@ -244,6 +287,15 @@ def check_calibration(cal, pose, rep):
 def check_counterfactual(cf, pose, exp_pose, rep):
     md = json.load(open(os.path.join(cf, "metadata.json")))
     mode = md["counterfactual_mode"]
+    limit = max(MAX_TCP_SPEED, EXPERT_SPEED_MARGIN * peak_speed(exp_pose))
+    pk = peak_speed(pose)
+    if pk > limit:
+        rep.err(cf, f"implausible TCP speed: {mode} peak {pk:.2f} m/s > {limit:.2f}")
+    if mode == "scripted_diverge":
+        want = {"left", "right"} if md["arms"] == "both" else {md["arms"]}
+        got = {sg["arm"] for sg in md.get("scripted", [])}
+        if not want <= got:
+            rep.err(cf, f"scripted plan missing: chose {md['arms']}, scripted {sorted(got) or 'nothing'}")
     E, C = tcp(exp_pose), tcp(pose)
     n = min(len(E), len(C))
     d = np.linalg.norm(E[:n] - C[:n], axis=2)
@@ -305,6 +357,9 @@ def main():
     ap.add_argument("--show", type=int, default=40, help="max error lines to print")
     ap.add_argument("--tasks", default="", help="comma-separated task names (default: all)")
     ap.add_argument("--json_out", default="", help="also write the findings here as JSON")
+    ap.add_argument("--exclude_out", default="", help="write erroneous rollout/unit dirs here")
+    ap.add_argument("--dark_scan", action="store_true", help="scan every wrist video for dark frames")
+    ap.add_argument("--dark_stride", type=int, default=3, help="frame stride of the dark scan")
     a = ap.parse_args()
 
     units = sorted(glob.glob(os.path.join(a.set_dir, "*", "episode_*", "camera_poses_*")))
@@ -331,6 +386,10 @@ def main():
         with open(a.json_out, "w") as f:
             json.dump({"units": len(units), "errors": rep.errors, "warnings": rep.warns,
                        "counts": dict(rep.counts)}, f, indent=1)
+    if a.exclude_out:
+        with open(a.exclude_out, "w") as f:
+            for where, msg in sorted(rep.bad.items()):
+                f.write(f"{os.path.abspath(where)}\t{msg}\n")
     sys.exit(1 if rep.errors else 0)
 
 
@@ -340,6 +399,10 @@ def check_unit(u, st, by_mode, rep, a):
     if exp is None:
         return
     st["expert_T"].append(len(exp["left_gripper_pose"]))
+    if peak_speed(exp) > MAX_TCP_SPEED:
+        rep.warn(os.path.join(u, "expert"), f"fast expert motion: peak {peak_speed(exp):.2f} m/s")
+    if a.dark_scan:
+        check_dark(os.path.join(u, "expert"), rep, a.dark_stride)
     em = json.load(open(os.path.join(u, "expert", "metadata.json")))
     if not em.get("success"):
         rep.err(u, "expert not successful")
@@ -347,6 +410,10 @@ def check_unit(u, st, by_mode, rep, a):
     if os.path.isdir(cal):
         cp = check_rollout(cal, rep, not a.no_videos)
         if cp is not None:
+            if peak_speed(cp) > MAX_TCP_SPEED:
+                rep.err(cal, f"implausible TCP speed: calibration peak {peak_speed(cp):.2f} m/s")
+            if a.dark_scan:
+                check_dark(cal, rep, a.dark_stride)
             mr = check_calibration(cal, cp, rep)
             st["legs"] += len(mr["legs"])
             st["skipped"] += len(mr.get("skipped", []))
@@ -355,6 +422,8 @@ def check_unit(u, st, by_mode, rep, a):
         if p is None:
             continue
         md = check_counterfactual(cf, p, exp, rep)
+        if a.dark_scan:
+            check_dark(cf, rep, a.dark_stride)
         div = md["divergence"]
         by_mode[md["counterfactual_mode"]].append(
             (div.get("max_tcp_m", 0.0), bool(div.get("accepted")), bool(md.get("task_success"))))
