@@ -219,4 +219,6 @@ the current gates (`generate.py --redo_list`), reusing each unit's saved expert 
 and expert poses; scene and rendering settings are restored from the unit's
 `base_init.json`, only the counterfactual settings are new, and the old dirs are backed up
 under `<data root>/_redo_backup/`. Unit-level problems (e.g. a failed wrist mount) cannot
-be repaired this way and stay in the exclude list.
+be repaired this way; `scripts/quarantine.py` moves whatever still fails after a redo out of
+the dataset tree (`<data root>/_quarantine/`, reversible), since the SyncWorld loader walks
+the tree and has no exclude list.
