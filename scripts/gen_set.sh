@@ -68,7 +68,7 @@ REPO="$(cd "${SCRIPT_DIR}/.." && pwd)"
 : "${CALIB_TRANS_M:=0.05,0.08}"
 : "${CALIB_ROT_DEG:=12,20}"
 : "${CALIB_TRANS_SPEED_MPS:=0.08}"
-: "${CALIB_ROT_SPEED_DPS:=40}"
+: "${CALIB_ROT_SPEED_DPS:=20}"          # 12-20 deg in ~12-21 frames, like the translations
 # counterfactuals
 : "${NUM_CF:=4}"
 : "${CF_MODE_PROBS:=noisy_replay:0.35,scripted_diverge:0.3,freeze_arm:0.2,gripper_flip:0.15}"
@@ -127,6 +127,20 @@ fi
 
 mkdir -p "${LOG_DIR}" "${STATE_DIR}"
 export ROBOTWIN_ROOT PYTHONWARNINGS=ignore PYTHONUNBUFFERED=1
+
+# Fail fast on a broken environment instead of failing every task on import: a file purge
+# once deleted part of the conda env mid-run, and every task started afterwards died in
+# seconds. Imports RoboTwin's base task (open3d, toppra, mplib, sapien) and curobo's planner
+# (needs a GPU, which the generator needs anyway).
+if [[ "${DRY_RUN}" != 1 && "${SKIP_PREFLIGHT:-0}" != 1 ]]; then
+  if ! (cd "${ROBOTWIN_ROOT}" && CUDA_VISIBLE_DEVICES="${GPU_ARR[0]}" "${PYTHON_BIN}" -c \
+        "import envs._base_task; from curobo.wrap.reacher.motion_gen import MotionGen" \
+        > "${LOG_DIR}/_preflight.log" 2>&1); then
+    echo "[gen_set] PREFLIGHT FAILED: the Python environment cannot import the generator stack"
+    tail -5 "${LOG_DIR}/_preflight.log"
+    exit 1
+  fi
+fi
 
 run_task() {
   local task="$1" gpu="$2"
