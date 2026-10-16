@@ -158,6 +158,11 @@ class RigRecorder:
     def gripper_track(self):
         return np.stack([self.log["left_g"], self.log["right_g"]], axis=1)
 
+    def quat_track(self):
+        """[T, 2, 4] TCP orientations of (left, right), wxyz."""
+        return np.stack([np.asarray(self.log["left_pose"])[:, 3:7],
+                         np.asarray(self.log["right_pose"])[:, 3:7]], axis=1)
+
     def actions(self):
         L = self.log
         lp, rp = np.asarray(L["left_pose"]), np.asarray(L["right_pose"])
