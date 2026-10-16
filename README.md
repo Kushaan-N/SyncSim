@@ -24,8 +24,10 @@ two.
   only if its own gripper stays in frame and its ray-traced view is clean.
 * **Bimanual visual calibration.** Every end-effector degree of freedom of each arm (x, y, z,
   roll, pitch, yaw) is swept out and back in a straight line while everything else holds
-  still: 24 single-DoF legs. The exact frame span of every leg is recorded.
-* **Counterfactual episodes**, each checked to actually differ from the expert:
+  still: 12 legs (2 arms × 6 DoF), each out and back. The exact frame span of every leg is
+  recorded.
+* **Counterfactual episodes**, each checked to actually differ from the expert and to stay
+  physically plausible (no end effector faster than 1 m/s):
   * `noisy_replay`: smooth joint-space perturbations on the left, right, or both arms;
   * `scripted_diverge`: the expert up to a breakpoint, then scripted end-effector motions;
   * `freeze_arm`: one arm stops, at a point where it still had somewhere to go, while the
@@ -72,14 +74,26 @@ DRY_RUN=1 NUM_SETS=2 PARTITION=<partition> ACCOUNT=<account> ./scripts/submit_sl
 NUM_SETS=2 PARTITION=<partition> ACCOUNT=<account> ./scripts/submit_slurm.sh
 ```
 
-Runs resume where they stopped: finished units are marked `_DONE`, and seeds the scripted
-expert cannot solve are remembered in `<task>/_dropped.json`.
+Runs resume where they stopped: finished units are marked `_DONE`, and seeds that were
+dropped (expert failure, unstable scene, camera gate, or an error) are remembered in
+`<task>/_dropped.json`.
 
 Check a generated set without the simulator (file structure, frame counts, counterfactual
 divergence per mode, task success rates; `--montage_dir` saves frame grids of every view):
 
 ```bash
 python scripts/verify_set.py --set_dir data/set_0 --montage_dir montage/
+```
+
+To repair a set, list every bad rollout (`--dark_scan` also decodes every wrist video to
+catch views that go dark mid-episode), then regenerate the listed counterfactuals in place
+on a GPU node. The originals are backed up under `<data>/_redo_backup/`; units whose
+problem is not a counterfactual stay in the list, which doubles as a training exclude list.
+
+```bash
+python scripts/verify_set.py --set_dir data/set_0 --dark_scan --exclude_out bad.tsv
+LIST=bad.tsv DRY_RUN=1 bash scripts/redo_cf.sh      # show what would be regenerated
+LIST=bad.tsv bash scripts/redo_cf.sh
 ```
 
 While a run is in progress, validate each task as soon as it finishes (verdicts go to
@@ -96,7 +110,7 @@ python scripts/dataset_stats.py --root data --json_out stats.json
 SyncWorld's gripperhead loader reads the layout below directly.
 
 * **Bimanual** (14-D action, 7 per arm; calibration segmented per arm): point the loader at
-  the data root with `arms = "both"` and `calib_segments = 12` (6 positive sweeps per arm) or
+  the data root with `arms = "both"` and `calib_segments = 12` (6 sweeps per arm, one per DoF) or
   `24` (both directions), in a SyncWorld build that has the `arms` option.
 * **Single-arm**, for the stock loader: export one arm's view of a set (videos are symlinked,
   nothing is copied). The action then covers only that arm while both move in the video, so
