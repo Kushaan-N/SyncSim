@@ -32,6 +32,7 @@ scripts/watch_validate.sh validate each task as soon as it finishes (-> <data>/_
 scripts/dataset_stats.py  yield / camera / calibration / counterfactual stats for a data root
 scripts/export_singlearm.py one-arm export for SyncWorld's stock (single-arm) loader
 scripts/redo_cf.sh        regenerate the counterfactuals in a verify_set exclude list
+scripts/quarantine.py     move what still fails out of the dataset tree (reversible)
 ```
 
 ## Environment (AICR cluster)
