@@ -99,13 +99,18 @@ recorded in `views.json` (`gate_rt_check`, `gate_rt_ok`) and checked by `verify_
 
 Per arm, each of its 6 EE DoFs (x, y, z, roll, pitch, yaw — world-frame translations,
 rotations about world axes through the gripper centre) goes **out → hold → back → hold** while
-the other arm and both grippers hold still: **24 single-DoF legs** in total (2 arms × 6 DoF ×
-out/back). Arm order random; within an arm translations (shuffled) then rotations
-(shuffled), random sign — the paper's / robocasa's randomisation.
+the other arm and both grippers hold still: **12 legs** (2 arms × 6 DoF), each filmed out
+and back, i.e. 24 single-DoF sweeps. Arm order random; within an arm translations (shuffled)
+then rotations (shuffled), each with a random sign. (Robocasa shuffles the translations but
+uses a fixed Pitch, Yaw, Roll order for rotations.)
 
 Robocasa commanded per-step OSC deltas, so magnitude = speed. RoboTwin is joint-position
-controlled, so each leg is **planned with curobo** from the current state and **re-timed to a
-constant speed** (`motion.retime`); magnitude (distance) and speed are independent knobs.
+controlled, so each leg is **planned as a straight line** from the current state — mplib's
+screw planner, else a chain of short curobo hops that cannot change IK branch
+(`motion.plan_to`) — and **re-timed to a constant speed** (`motion.retime`); magnitude
+(distance) and speed are independent knobs. Translations are 5–8 cm at 8 cm/s, rotations
+12–20° at 20°/s, so both last ~12–21 frames: SyncWorld subsamples calibration clips every
+3rd frame, and at the earlier 40°/s a rotation leg gave it only ~3 frames.
 Unreachable legs retry at 60 % and 35 % of the magnitude, else are recorded as skipped.
 
 **Probe, then film.** The sweep is first run unrendered; a leg whose measured motion misses
@@ -139,8 +144,19 @@ Robocasa lessons applied:
 
 * **Make sure a perturbation acts.** Robocasa's legacy perturbation hit only the sign-read
   gripper dim and was a no-op. Here every counterfactual is probed unrendered, measured
-  against the expert (max TCP deviation per arm, gripper-command mismatch), and re-rolled
-  with ×1.6 magnitude below 5 cm unless the gripper differs on ≥5 % of frames.
+  against the expert (max TCP deviation and max gripper rotation per arm, gripper-command
+  mismatch), and re-rolled with ×1.6 magnitude unless it moves ≥ 5 cm, rotates ≥ 10°, or
+  its gripper differs on ≥ 5 % of frames. Which arms actually diverged is recorded
+  (`divergence.diverging_arms`); for `scripted_diverge` the unchosen arm holds, so it can
+  diverge too even though `arms` names only the scripted one.
+* **Make sure it is physically plausible.** A short scripted segment that executes a long
+  joint-space path (RoboTwin's planner may swing through another IK branch) moved the arm
+  at up to 12 m/s in the first full run. Scripted plans are now refused if any joint
+  travels more than 2 rad, and timed so no joint exceeds 1.5 rad/s; every attempt of every
+  mode is rejected if a TCP exceeds 1 m/s (or 1.5× the expert's own peak), and an
+  implausible attempt is never kept, not even as the most divergent fallback.
+  `scripted_diverge` also requires a plan for every arm it chose — previously a failed plan
+  left a "counterfactual" whose only change was the other arm holding still.
 * **Make sure it acts, for every mode.** `freeze_arm` draws its breakpoint only from frames
   after which the frozen arm's TCP still travels ≥ `freeze_min_remaining_m` (8 cm; else freezing
   is a no-op: late breakpoints, or the idle arm of a one-armed task); with no such frame for
@@ -186,3 +202,21 @@ the measured divergence (overall and per arm), the attempt log, and whether the 
   across seeds the variety is already there.
 * The physical-event ground truth (`physical_state.npz`, seg videos, contacts) — only
   per-frame object poses and articulated-object joint positions are recorded for now.
+* Robocasa's shared-breakpoint `scripted_diverge` subcases (two futures from one prefix),
+  its multi-DoF scripted motions, and its gripper flip on top of `noisy_replay` — here the
+  flip is its own mode and scripted motions are single-DoF per arm.
+* Camera diversity knobs: the front-bias cone about the gripper approach axis, local position
+  jitter, and full orientation jitter (only roll is jittered, so the target stays centred).
+  The elevation band is 15–65° rather than robocasa's −5–45° (robocasa found low views
+  both more diverse and more often accepted; lowering the band here is untested).
+
+## 9. Repairing a generated set
+
+`verify_set.py --exclude_out bad.tsv` lists every rollout or unit with an error (including
+implausible TCP speeds, missing scripted plans and, with `--dark_scan`, wrist videos that go
+dark mid-episode). `scripts/redo_cf.sh` regenerates the listed counterfactuals in place with
+the current gates (`generate.py --redo_list`), reusing each unit's saved expert stream, rig
+and expert poses; scene and rendering settings are restored from the unit's
+`base_init.json`, only the counterfactual settings are new, and the old dirs are backed up
+under `<data root>/_redo_backup/`. Unit-level problems (e.g. a failed wrist mount) cannot
+be repaired this way and stay in the exclude list.
