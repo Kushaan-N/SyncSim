@@ -14,7 +14,8 @@ Per (task, arm, episode, camera unit, third-person view v) it writes
             wrist_rgb/video.mp4     -> that arm's wrist camera
             pose.pkl                gripper_matrix / gripper_open / gripper_pose of that arm
             metadata.json           -> original
-        calibration/move_range.pkl  movement_order of that arm's legs ("X+", "Pitch-", ...)
+        calibration/move_range.pkl  movement_order of that arm's legs ("X+", "Pitch-", ...), in
+                                    SyncWorld's axis convention (see `loader_token`)
 
 LIMITS (why this is a smoke test, not training data): the action is one arm's while both
 arms move in the video, and counterfactuals that edited only the OTHER arm would look like
@@ -30,7 +31,36 @@ import pickle
 import numpy as np
 
 VIEW_DIR = lambda v: "agentview_rgb" if v == 0 else f"agentview_rgb_{v}"
-DOF_TOKEN = {"x": "X", "y": "Y", "z": "Z", "roll": "Roll", "pitch": "Pitch", "yaw": "Yaw"}
+# SyncWorld's calib_segments axis order: x, y, z, then ZYX euler angles yaw, pitch, roll
+LOADER_AXES = ("X", "Y", "Z", "Yaw", "Pitch", "Roll")
+
+
+def _euler_zyx_deg(R):
+    """(yaw, pitch, roll) in degrees, ZYX -- the same convention as SyncWorld's
+    calib_segments._rotmat_to_euler_zyx."""
+    pitch = np.arcsin(-np.clip(R[2, 0], -1.0, 1.0))
+    if np.cos(pitch) < 1e-8:
+        return np.degrees([np.arctan2(-R[0, 1], R[1, 1]) if R[2, 0] < 0
+                           else np.arctan2(R[0, 1], R[1, 1]), pitch, 0.0])
+    return np.degrees([np.arctan2(R[1, 0], R[0, 0]), pitch, np.arctan2(R[2, 1], R[2, 2])])
+
+
+def loader_token(mats, leg):
+    """movement_order token of one calibration leg as SyncWorld's loader sees it.
+
+    SyncSim legs rotate about WORLD axes, but the loader names rotations by the ZYX euler
+    angle of the gripper matrix that changes most -- which world axis that is depends on the
+    gripper's resting orientation (on aloha-agilex a world-x "roll" leg moves euler pitch,
+    with the opposite sign). So the token is measured from the leg's own filmed poses."""
+    a, b = leg["out_start_frame"], min(leg["out_end_frame"], len(mats) - 1)
+    if leg["dof"] in ("x", "y", "z"):
+        d = mats[b][:3, 3] - mats[a][:3, 3]
+        k = int(np.argmax(np.abs(d)))
+    else:
+        d = (_euler_zyx_deg(mats[b][:3, :3]) - _euler_zyx_deg(mats[a][:3, :3]) + 180) % 360 - 180
+        k = 3 + int(np.argmax(np.abs(d)))
+        d = np.concatenate([np.zeros(3), d])
+    return LOADER_AXES[k] + ("+" if d[k] >= 0 else "-")
 
 
 def _link(src, dst):
@@ -78,7 +108,9 @@ def export_unit(unit, out_unit_base, arm, n_views):
         cal = os.path.join(unit, "calibration")
         if os.path.isdir(cal) and export_rollout(cal, os.path.join(dst_unit, "calibration"), arm, v):
             mr = json.load(open(os.path.join(cal, "move_range.json")))
-            order = [DOF_TOKEN[l["dof"]] + l["sign"] for l in mr["legs"] if l["arm"] == arm]
+            with open(os.path.join(cal, "pose.pkl"), "rb") as f:
+                mats = np.asarray(pickle.load(f)[f"{arm}_gripper_matrix"], dtype=np.float64)
+            order = [loader_token(mats, l) for l in mr["legs"] if l["arm"] == arm]
             with open(os.path.join(dst_unit, "calibration", "move_range.pkl"), "wb") as f:
                 pickle.dump({"movement_order": order, "syncsim_arm": arm,
                              "legs": [l for l in mr["legs"] if l["arm"] == arm]}, f)
