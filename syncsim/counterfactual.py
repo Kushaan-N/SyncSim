@@ -7,12 +7,15 @@ in its CONTROLS only. Modes (one per counterfactual index, drawn with `cf_mode_p
                    on one arm, the other, or both (`cf_arm_probs`). By default the offsets
                    PERSIST after their ramp (`noise_persist`), the joint-space analogue of
                    robocasa's integrating OSC deltas -- a pure bump would let the arm snap
-                   back to the expert path. Optionally also a gripper sign flip.
+                   back to the expert path. (Gripper flips are their own mode, below.)
   scripted_diverge expert prefix to a breakpoint, then 1-2 scripted end-effector motions
                    planned LIVE from the breakpoint state for the chosen arm(s); the other
                    arm (if not chosen) and both grippers HOLD their breakpoint command
                    (robocasa's opt-in `hold` mode -- its legacy default reopened the gripper,
                    confounding "arm went elsewhere" with "arm dropped the object").
+                   Every chosen arm must get a plan in every segment, and a plan whose joint
+                   path is a long detour (an IK-branch swing) is refused; segments are timed
+                   so neither the end effector nor any joint exceeds its speed limit.
   freeze_arm       BIMANUAL-ONLY. From the breakpoint one arm holds its command while the
                    other keeps executing the expert: coordination breaks (no handover, the
                    second hand never arrives) without either arm doing anything unnatural.
@@ -21,9 +24,13 @@ in its CONTROLS only. Modes (one per counterfactual index, drawn with `cf_mode_p
 
 Robocasa lessons kept:
   * a perturbation that does not visibly change anything is useless -> every rollout is
-    measured against the expert (max TCP deviation, per arm) and re-rolled with escalated
-    magnitude below `cf_min_tcp_deviation_m`, unless its gripper commands differ from the
-    expert's on >= `cf_min_gripper_mismatch_frac` of frames (a release IS a counterfactual);
+    measured against the expert (max TCP deviation and max gripper rotation, per arm) and
+    re-rolled with escalated magnitude below `cf_min_tcp_deviation_m` /
+    `cf_min_rot_deviation_deg`, unless its gripper commands differ from the expert's on
+    >= `cf_min_gripper_mismatch_frac` of frames (a release IS a counterfactual);
+  * a rollout must also be physically plausible: no end effector may move faster than
+    `cf_max_tcp_speed_mps` (or 1.5x the expert's own peak, if that is higher) -- a short
+    segment that executes a long joint-space path swings the arm at metres per second;
   * breakpoints reserve a minimum suffix, so a late breakpoint cannot yield an expert-with-a-
     3-step-tail;
   * the gripper is perturbed by an explicit flip, never by additive noise (RoboTwin grippers
@@ -147,17 +154,34 @@ def scripted_suffix(rollout, rng, cfg, arms, escalation):
                 speed = cfg.diverge_trans_speed_mps
             sign = 1.0 if rng.random() < 0.5 else -1.0
             start7 = ee_pose(robot, arm)
+            refused = []
             for shrink in (1.0, 0.6, 0.35):
-                path = plan_to(robot, arm, displaced_pose(start7, dof, sign * mag * shrink),
-                               method="screw_then_curobo")
-                if path is not None:
-                    n = max(10, int(math.ceil(mag * shrink / speed / dt)))
+                target = displaced_pose(start7, dof, sign * mag * shrink)
+                # straight-line (screw / short-hop chain) first, then RoboTwin's joint-space
+                # planner -- whose path may swing through another IK branch, hence the check
+                for method in ("screw", "curobo"):
+                    path = plan_to(robot, arm, target, method=method)
+                    if path is None:
+                        continue
+                    travel = joint_travel(path)
+                    if travel > cfg.diverge_max_joint_travel_rad:
+                        refused.append(f"{method}@{shrink}: joint travel {travel:.2f} rad")
+                        continue
+                    n_cart = mag * shrink / speed / dt
+                    n_joint = joint_arc_length(path) / cfg.diverge_max_joint_speed_rps / dt
+                    n = max(10, int(math.ceil(max(n_cart, n_joint))))
                     plans[arm] = (path, n)
                     log.append({"segment": si, "arm": arm, "dof": str(dof),
-                                "amount": float(sign * mag * shrink)})
+                                "amount": float(sign * mag * shrink), "planner": method,
+                                "joint_travel_rad": float(travel), "steps": int(n)})
                     break
-        if not plans:
-            continue
+                if arm in plans:
+                    break
+            if arm not in plans:
+                # an arm the mode chose that cannot move would leave a counterfactual whose
+                # only change is the OTHER arm holding still -- not what the label says
+                raise RuntimeError(f"scripted_diverge: no admissible plan for {arm} {dof} "
+                                   f"(segment {si}; {'; '.join(refused) or 'planning failed'})")
         n = max(v[1] for v in plans.values())
         seg = None
         for arm, (path, _) in plans.items():
@@ -178,8 +202,43 @@ def scripted_suffix(rollout, rng, cfg, arms, escalation):
 # ----------------------------------------------------------------------------------------
 # divergence measurement
 # ----------------------------------------------------------------------------------------
-def divergence(expert_tcp, cf_tcp, expert_g, cf_g):
-    """expert_tcp/cf_tcp [T, 2, 3]; expert_g/cf_g [T, 2] gripper commands."""
+def joint_travel(path):
+    """Largest total travel of any single joint along a joint path [n, d] (rad)."""
+    p = np.asarray(path, dtype=np.float64)
+    if len(p) < 2:
+        return 0.0
+    return float(np.abs(np.diff(p, axis=0)).sum(axis=0).max())
+
+
+def joint_arc_length(path):
+    """Joint-space arc length of a path [n, d]; `retime` spreads it uniformly over time, so
+    arc length / duration bounds every joint's speed."""
+    p = np.asarray(path, dtype=np.float64)
+    if len(p) < 2:
+        return 0.0
+    return float(np.linalg.norm(np.diff(p, axis=0), axis=1).sum())
+
+
+def quat_angle_deg(qa, qb):
+    """Rotation angle between unit quaternions (any consistent component order), [...]."""
+    d = np.abs(np.sum(np.asarray(qa) * np.asarray(qb), axis=-1))
+    return np.degrees(2 * np.arccos(np.clip(d, -1.0, 1.0)))
+
+
+def tcp_speed(tcp, fps):
+    """Per-arm peak TCP speed (m/s) and largest single-frame TCP jump (m) of a [T, 2, 3]
+    track sampled at `fps`."""
+    t = np.asarray(tcp, dtype=np.float64)
+    if len(t) < 2:
+        return {a: {"peak_mps": 0.0, "max_jump_m": 0.0} for a in ("left", "right")}
+    step = np.linalg.norm(np.diff(t, axis=0), axis=2)                     # [T-1, 2]
+    return {a: {"peak_mps": float(step[:, j].max() * fps), "max_jump_m": float(step[:, j].max())}
+            for j, a in enumerate(("left", "right"))}
+
+
+def divergence(expert_tcp, cf_tcp, expert_g, cf_g, expert_quat=None, cf_quat=None):
+    """expert_tcp/cf_tcp [T, 2, 3]; expert_g/cf_g [T, 2] gripper commands; optional
+    expert_quat/cf_quat [T, 2, 4] TCP orientations (same component order in both)."""
     n = min(len(expert_tcp), len(cf_tcp))
     if n == 0:
         return {"n_compared": 0}
@@ -189,7 +248,13 @@ def divergence(expert_tcp, cf_tcp, expert_g, cf_g):
            "max_tcp_m": float(d.max()), "mean_tcp_m": float(d.mean()),
            "final_tcp_m": float(d[-1].max()),
            "gripper_mismatch_frac": float(gm.any(axis=1).mean())}
+    r = None
+    if expert_quat is not None and cf_quat is not None:
+        r = quat_angle_deg(np.asarray(expert_quat[:n]), np.asarray(cf_quat[:n]))      # [n, 2]
+        out["max_rot_deg"] = float(r.max())
     for j, arm in enumerate(("left", "right")):
         out[arm] = {"max_tcp_m": float(d[:, j].max()), "mean_tcp_m": float(d[:, j].mean()),
                     "gripper_mismatch_frac": float(gm[:, j].mean())}
+        if r is not None:
+            out[arm]["max_rot_deg"] = float(r[:, j].max())
     return out
