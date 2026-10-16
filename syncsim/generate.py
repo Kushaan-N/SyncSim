@@ -93,13 +93,10 @@ class Config:
     calib_trans_m: tuple = (0.05, 0.08)
     calib_rot_deg: tuple = (12.0, 20.0)
     calib_trans_speed_mps: float = 0.08
-    calib_rot_speed_dps: float = 40.0
+    calib_rot_speed_dps: float = 20.0        # 12-20 deg legs -> ~12-21 frames, like translations
     calib_pause_steps: int = 60              # physics steps (0.24 s) held between legs
     calib_warmup_steps: int = 0
     calib_shuffle_arms: bool = True
-    calib_track_tol: float = 0.25            # leg rejected if its commanded DoF misses by >25 %
-    calib_max_spurious_rot_deg: float = 5.0  # ... or a translation leg rotates more than this
-    calib_max_spurious_trans_m: float = 0.03 # ... or a rotation leg translates more than this
     calib_track_tol: float = 0.25            # leg rejected if its commanded DoF misses by >25 %
     calib_max_spurious_rot_deg: float = 5.0  # ... or a translation leg rotates more than this
     calib_max_spurious_trans_m: float = 0.03 # ... or a rotation leg translates more than this
@@ -108,7 +105,10 @@ class Config:
     cf_mode_probs: str = "noisy_replay:0.35,scripted_diverge:0.3,freeze_arm:0.2,gripper_flip:0.15"
     cf_arm_probs: str = "left:0.35,right:0.35,both:0.3"
     cf_min_tcp_deviation_m: float = 0.05
+    cf_min_rot_deviation_deg: float = 10.0   # ... or a gripper ROTATES this far from the expert's
     cf_min_gripper_mismatch_frac: float = 0.05
+    cf_max_tcp_speed_mps: float = 1.0        # plausibility: no TCP faster than this ...
+    cf_expert_speed_margin: float = 1.5      # ... unless the expert itself is (then 1.5x its peak)
     cf_max_attempts: int = 3
     cf_escalation: float = 1.6
     cf_min_prefix_frames: int = 4
@@ -127,8 +127,12 @@ class Config:
     diverge_rot_deg: tuple = (15.0, 35.0)
     diverge_trans_speed_mps: float = 0.12
     diverge_rot_speed_dps: float = 50.0
+    diverge_max_joint_speed_rps: float = 1.5 # scripted segments are timed so no joint exceeds this
+    diverge_max_joint_travel_rad: float = 2.0  # a plan swinging one joint further is refused
     diverge_pause_steps: int = 40
     diverge_tail_steps: int = 120
+    # ---- repair mode --------------------------------------------------------------------------
+    redo_list: str = ""                      # file of counterfactual dirs to regenerate in place
 
 
 def _parse_probs(s):
@@ -202,6 +206,13 @@ def _freeze_breakpoint(rng, cfg, expert_tcp, arm_pref):
         if frames:
             return arm, int(rng.choice(frames)) * cfg.frame_stride
     raise ValueError("freeze_arm: no arm moves enough after any admissible breakpoint")
+
+
+_REDO_SCENE_KEYS = ("task", "task_config", "embodiment", "random_background", "cluttered_table",
+                    "random_light", "random_table_height")
+_REDO_NEW_PREFIXES = ("cf_", "noise_", "flip_", "diverge_", "freeze_", "num_counterfactuals",
+                      "redo_", "output_dir", "overwrite", "seed_start", "num_seeds",
+                      "max_episodes")
 
 
 def _rig_json(rig, cfg):
@@ -312,6 +323,88 @@ class Generator:
         print(f"[syncsim] {cfg.task}: kept {kept} episode(s) from seeds "
               f"[{cfg.seed_start}, {cfg.seed_start + cfg.num_seeds})")
 
+    # ------------------------------------------------------------------------------------
+    def redo(self):
+        """Regenerate the counterfactual dirs listed in `cfg.redo_list` (one path per line,
+        optionally followed by a tab and a reason) that belong to this task and output_dir,
+        in place, from the unit's saved expert stream, rig and expert poses -- no expert
+        planning, camera gate or calibration is rerun. The old dir is moved to
+        <data root>/_redo_backup/<set>/<task>/... first and restored if regeneration fails.
+        The mode and arm are drawn from the same seeded rng as the original, so the dataset's
+        mode mix is unchanged; the new gates decide what is kept."""
+        import pickle
+        from .rt_env import ControlStream
+        cfg = self.cfg
+        set_dir = os.path.abspath(cfg.output_dir)
+        backup_root = os.path.join(os.path.dirname(set_dir), "_redo_backup",
+                                   os.path.basename(set_dir))
+        todo = []
+        with open(cfg.redo_list) as f:
+            for line in f:
+                if not line.strip() or line.startswith("#"):
+                    continue
+                path, _, reason = line.rstrip("\n").partition("\t")
+                path = os.path.abspath(path.strip())
+                if os.path.dirname(os.path.dirname(os.path.dirname(path))) == os.path.abspath(self.task_dir):
+                    todo.append((path, reason.strip()))
+        print(f"[redo] {cfg.task}: {len(todo)} counterfactual(s) listed for {set_dir}")
+        n_ok = 0
+        for cf_dir, reason in todo:
+            unit = os.path.dirname(cf_dir)
+            k = int(os.path.basename(cf_dir).split("_")[1])
+            m = int(os.path.basename(unit).split("_")[-1])
+            seed = int(os.path.basename(os.path.dirname(unit)).split("_")[-1])
+            with open(os.path.join(unit, "base_init.json")) as f:
+                orig = json.load(f)["config"]
+            # the scene must be the original one (these build self.args at start-up) ...
+            clash = [key for key in _REDO_SCENE_KEYS if orig.get(key) != getattr(cfg, key)]
+            if clash:
+                print(f"[redo] skip {cf_dir}: config differs from the original in {clash}")
+                continue
+            # ... every other non-counterfactual knob (rendering, frame stride, camera salt --
+            # which also seeds the mode / arm draw) is restored from the original run, so
+            # only the counterfactual settings (cf_*, noise_*, ...) take this run's values
+            for key, val in orig.items():
+                if (hasattr(cfg, key) and not key.startswith(_REDO_NEW_PREFIXES)
+                        and key not in _REDO_SCENE_KEYS):
+                    setattr(cfg, key, tuple(val) if isinstance(getattr(cfg, key), tuple) else val)
+            with open(os.path.join(unit, "views.json")) as f:
+                v = json.load(f)
+            rig = {"views": [{"mat": x["cam2world_sapien"]} for x in v["views"]],
+                   "wrist": {a: {"rel_mat": w["rel_mat"]} for a, w in v["wrist"].items()}}
+            stream = ControlStream.load(os.path.join(unit, "expert_stream.npz"))
+            with open(os.path.join(unit, "expert", "pose.pkl"), "rb") as f:
+                P = pickle.load(f)
+            arms = ("left", "right")
+            expert_tcp = np.stack([P[f"{a}_gripper_pose"][:, :3] for a in arms], axis=1)
+            expert_quat = np.stack([np.roll(P[f"{a}_gripper_pose"][:, 3:7], 1, axis=1)
+                                    for a in arms], axis=1)                  # xyzw -> wxyz
+            expert_g = np.stack([P[f"{a}_gripper_open"] for a in arms], axis=1)
+            backup = os.path.join(backup_root, os.path.relpath(cf_dir, set_dir))
+            os.makedirs(os.path.dirname(backup), exist_ok=True)
+            if os.path.exists(backup):
+                shutil.rmtree(backup)
+            shutil.move(cf_dir, backup)
+            try:
+                self.counterfactual(seed, m, k, unit, rig, stream, expert_tcp, expert_g,
+                                    expert_quat)
+                md_path = os.path.join(cf_dir, "metadata.json")
+                with open(md_path) as f:
+                    md = json.load(f)
+                md["regenerated"] = {"time": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                                     "reason": reason, "backup": backup}
+                from .recorder import write_json
+                write_json(md_path, md)
+                n_ok += 1
+            except Exception:
+                traceback.print_exc()
+                shutil.rmtree(cf_dir, ignore_errors=True)
+                shutil.move(backup, cf_dir)
+                print(f"[redo] FAILED {cf_dir}: original restored")
+            finally:
+                self.rt.close_task(self.task, clear_cache=True)
+        print(f"[redo] {cfg.task}: regenerated {n_ok}/{len(todo)}")
+
     def _episode_complete(self, ep_dir):
         return all(os.path.exists(os.path.join(ep_dir, f"camera_poses_{m}", "_DONE"))
                    for m in range(self.cfg.num_camera_units))
@@ -374,7 +467,7 @@ class Generator:
             return False, "expert_replay_not_successful"
         exp_dir = os.path.join(unit, "expert")
         n_frames = rec.save(exp_dir, self.fps, cfg.frame_stride, crf=cfg.video_crf)
-        expert_tcp, expert_g = rec.tcp_track(), rec.gripper_track()
+        expert_tcp, expert_g, expert_quat = rec.tcp_track(), rec.gripper_track(), rec.quat_track()
         write_json(os.path.join(exp_dir, "metadata.json"), {
             "episode_type": "expert", "seed": seed, "task": cfg.task, "success": expert_success,
             "first_success_frame": succ["first_frame"],
@@ -402,7 +495,7 @@ class Generator:
 
         # ---- counterfactuals --------------------------------------------------------------
         for k in range(cfg.num_counterfactuals):
-            self.counterfactual(seed, m, k, unit, rig, stream, expert_tcp, expert_g)
+            self.counterfactual(seed, m, k, unit, rig, stream, expert_tcp, expert_g, expert_quat)
 
         with open(os.path.join(unit, "_DONE"), "w") as f:
             f.write(time.strftime("%Y-%m-%dT%H:%M:%S"))
@@ -429,8 +522,11 @@ class Generator:
         })
 
     # ------------------------------------------------------------------------------------
-    def _cf_attempt(self, seed, mode, arm_sel, esc, arng, stream, expert_tcp, expert_g, attempt):
-        """One unrendered probe of a counterfactual -> (executed stream, meta, divergence, ok)."""
+    def _cf_attempt(self, seed, mode, arm_sel, esc, arng, stream, expert_tcp, expert_g,
+                    expert_quat, speed_limit, attempt):
+        """One unrendered probe of a counterfactual -> (executed stream, meta, divergence, ok).
+        ok = physically plausible (no TCP faster than `speed_limit`) AND diverged (position,
+        rotation, or gripper commands)."""
         cfg = self.cfg
         from . import counterfactual as CF
         from .rollout import Rollout
@@ -470,12 +566,31 @@ class Generator:
             ro.run(stream.slice(0, p))
             meta["scripted"] = CF.scripted_suffix(ro, arng, cfg, CF.arms_of(arm_sel), esc)
         executed = ro.stream()
-        div = CF.divergence(expert_tcp, ro.rec.tcp_track(), expert_g, ro.rec.gripper_track())
-        ok = (div.get("max_tcp_m", 0) >= cfg.cf_min_tcp_deviation_m
-              or div.get("gripper_mismatch_frac", 0) >= cfg.cf_min_gripper_mismatch_frac)
-        return executed, meta, div, ok
+        div = CF.divergence(expert_tcp, ro.rec.tcp_track(), expert_g, ro.rec.gripper_track(),
+                            expert_quat, ro.rec.quat_track())
+        speed = CF.tcp_speed(ro.rec.tcp_track(), self.fps)
+        peak = max(v["peak_mps"] for v in speed.values())
+        div.update({"tcp_speed": speed, "peak_tcp_speed_mps": peak,
+                    "speed_limit_mps": float(speed_limit),
+                    "plausible": bool(peak <= speed_limit)})
+        div["diverging_arms"] = [a for a in ("left", "right") if self._arm_diverged(div.get(a, {}))]
+        diverged = (div.get("max_tcp_m", 0) >= cfg.cf_min_tcp_deviation_m
+                    or div.get("max_rot_deg", 0) >= cfg.cf_min_rot_deviation_deg
+                    or div.get("gripper_mismatch_frac", 0) >= cfg.cf_min_gripper_mismatch_frac)
+        return executed, meta, div, bool(diverged and div["plausible"])
 
-    def counterfactual(self, seed, m, k, unit, rig, stream, expert_tcp, expert_g):
+    def _arm_diverged(self, d):
+        cfg = self.cfg
+        return (d.get("max_tcp_m", 0) >= cfg.cf_min_tcp_deviation_m
+                or d.get("max_rot_deg", 0) >= cfg.cf_min_rot_deviation_deg
+                or d.get("gripper_mismatch_frac", 0) >= cfg.cf_min_gripper_mismatch_frac)
+
+    def _speed_limit(self, expert_tcp):
+        from . import counterfactual as CF
+        exp_peak = max(v["peak_mps"] for v in CF.tcp_speed(expert_tcp, self.fps).values())
+        return max(self.cfg.cf_max_tcp_speed_mps, self.cfg.cf_expert_speed_margin * exp_peak)
+
+    def counterfactual(self, seed, m, k, unit, rig, stream, expert_tcp, expert_g, expert_quat):
         cfg = self.cfg
         from . import counterfactual as CF
         from .recorder import write_json
@@ -489,6 +604,7 @@ class Generator:
         if mode == "freeze_arm" and not any(_freeze_frames(cfg, expert_tcp, a)
                                             for a in ("left", "right")):
             mode = "noisy_replay"       # nothing left to freeze in this expert
+        speed_limit = self._speed_limit(expert_tcp)
         attempts = []
         final = None
         n_att = max(1, cfg.cf_max_attempts)
@@ -505,7 +621,7 @@ class Generator:
             arng = np.random.default_rng(rng.integers(1 << 31) + attempt)
             try:
                 res = self._cf_attempt(seed, mode, arm_sel, esc, arng, stream, expert_tcp,
-                                       expert_g, attempt)
+                                       expert_g, expert_quat, speed_limit, attempt)
             except Exception as e:
                 traceback.print_exc()
                 attempts.append({"attempt": attempt, "mode": mode,
@@ -515,13 +631,19 @@ class Generator:
             arm_sel = meta["arms"]
             attempts.append({"attempt": attempt, "mode": mode, "escalation": esc,
                              "accepted": bool(ok), "max_tcp_m": div.get("max_tcp_m"),
-                             "gripper_mismatch_frac": div.get("gripper_mismatch_frac")})
-            if final is None or ok or div.get("max_tcp_m", 0) > final[2].get("max_tcp_m", 0):
+                             "max_rot_deg": div.get("max_rot_deg"),
+                             "gripper_mismatch_frac": div.get("gripper_mismatch_frac"),
+                             "plausible": div["plausible"],
+                             "peak_tcp_speed_mps": div["peak_tcp_speed_mps"]})
+            # an implausible rollout (arm swinging at metres per second) is never kept, not
+            # even as the "most divergent" fallback
+            if div["plausible"] and (final is None or ok
+                                     or div.get("max_tcp_m", 0) > final[2].get("max_tcp_m", 0)):
                 final = res
             if ok:
                 break
         if final is None:
-            raise RuntimeError(f"counterfactual {k}: every attempt failed: {attempts}")
+            raise RuntimeError(f"counterfactual {k}: no plausible attempt: {attempts}")
         executed, meta, div, ok = final
         # ---- render the accepted (or most divergent) executed stream exactly -------------
         self._reset(seed)
@@ -538,10 +660,12 @@ class Generator:
                      "first_success_frame": succ["first_frame"], "frames": n_frames,
                      "physics_steps": int(executed.n), "fps": self.fps,
                      "divergence": dict(div, threshold_m=cfg.cf_min_tcp_deviation_m,
+                                        threshold_rot_deg=cfg.cf_min_rot_deviation_deg,
                                         accepted=bool(ok), attempt_log=attempts)})
         write_json(os.path.join(cf_dir, "metadata.json"), meta)
         print(f"    [cf] seed {seed} unit {m} cf{k}: {meta['counterfactual_mode']}/{meta['arms']} max_tcp "
-              f"{div.get('max_tcp_m', 0):.3f} m gmis {div.get('gripper_mismatch_frac', 0):.2f} "
+              f"{div.get('max_tcp_m', 0):.3f} m rot {div.get('max_rot_deg', 0):.0f} deg "
+              f"peak {div['peak_tcp_speed_mps']:.2f} m/s gmis {div.get('gripper_mismatch_frac', 0):.2f} "
               f"success={success} attempts={len(attempts)}{'' if ok else ' (BELOW GATE)'}")
 
 
@@ -567,11 +691,13 @@ class _TrackOnly:
 
     def __init__(self, task):
         self.robot = task.robot
-        self.tcp, self.g = [], []
+        self.tcp, self.q, self.g = [], [], []
 
     def capture(self, step_idx, render=False):
         r = self.robot
-        self.tcp.append([r.get_left_tcp_pose()[:3], r.get_right_tcp_pose()[:3]])
+        lp, rp = np.asarray(r.get_left_tcp_pose()), np.asarray(r.get_right_tcp_pose())
+        self.tcp.append([lp[:3], rp[:3]])
+        self.q.append([lp[3:7], rp[3:7]])
         self.g.append([r.left_gripper_val, r.right_gripper_val])
 
     def tcp_track(self):
@@ -580,10 +706,14 @@ class _TrackOnly:
     def gripper_track(self):
         return np.asarray(self.g, dtype=np.float64)
 
+    def quat_track(self):
+        return np.asarray(self.q, dtype=np.float64)          # wxyz, like RigRecorder's
+
 
 def main(argv=None):
     cfg = Config(**vars(build_parser().parse_args(argv)))
-    Generator(cfg).run()
+    gen = Generator(cfg)
+    gen.redo() if cfg.redo_list else gen.run()
 
 
 if __name__ == "__main__":
