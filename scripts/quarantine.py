@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """Move the rollouts / units listed in a verify_set.py exclude file out of the dataset tree, so
-loaders that walk the data (SyncWorld's gripperhead loader has no exclude option) never see
+loaders that walk the data never see
 them -- reversibly, nothing is deleted.
 
     python scripts/quarantine.py --list bad.tsv [--dry_run]      # move listed dirs out
