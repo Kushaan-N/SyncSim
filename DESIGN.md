@@ -109,8 +109,8 @@ controlled, so each leg is **planned as a straight line** from the current state
 screw planner, else a chain of short curobo hops that cannot change IK branch
 (`motion.plan_to`) — and **re-timed to a constant speed** (`motion.retime`); magnitude
 (distance) and speed are independent knobs. Translations are 5–8 cm at 8 cm/s, rotations
-12–20° at 20°/s, so both last ~12–21 frames: SyncWorld subsamples calibration clips every
-3rd frame, and at the earlier 40°/s a rotation leg gave it only ~3 frames.
+12–20° at 20°/s, so both last ~12–21 frames (at the earlier 40°/s a rotation leg lasted
+only ~10, too few once a clip is temporally subsampled).
 Unreachable legs retry at 60 % and 35 % of the magnitude, else are recorded as skipped.
 
 **Probe, then film.** The sweep is first run unrendered; a leg whose measured motion misses
@@ -125,9 +125,8 @@ recorded (gripper-centre) actions makes a roll leg look like a translation too. 
 scripted counterfactual motions therefore rotate about the gripper centre (filmed drift over
 the 10,590 rotation legs of the full dataset: < 2 mm in 99 %, 6.4 mm at most).
 
-`move_range.json` records the exact out/back **frame spans** of every leg, so the SyncWorld
-segment extractor can read them instead of rediscovering "the strongest signed run" from
-pose deltas.
+`move_range.json` records the exact out/back **frame spans** of every leg, so downstream code
+can cut out each leg directly instead of rediscovering it from pose deltas.
 
 ---
 
@@ -179,8 +178,8 @@ the measured divergence (overall and per arm), the attempt log, and whether the 
 * Layout `set_<id>/<task>/episode_<seed>/camera_poses_<m>/...` mirrors robocasa, with
   `wrist_left_rgb/` + `wrist_right_rgb/` instead of `wrist_rgb/`. Episodes are named by
   **seed** (RoboTwin skips failing seeds; a seed is the stable identity).
-* `actions.npy` `[T,16]`: per arm TCP xyz + quat **xyzw** + commanded gripper opening — the
-  bimanual version of SyncWorld's 8-dim per-frame pose conditioning.
+* `actions.npy` `[T,16]`: per arm TCP xyz + quat **xyzw** + commanded gripper opening — two
+  copies of the single-arm 8-dim per-frame layout.
 * `pose.pkl` keys extend robocasa's (`left_/right_gripper_pose|matrix|open`).
 * Frame rate: physics 250 Hz, `FRAME_STRIDE=12` → 20.8 fps (robocasa 20 Hz).
 * Every control stream is saved (`expert_stream.npz`, `*/stream.npz`), so any rollout can be
@@ -220,5 +219,5 @@ and expert poses; scene and rendering settings are restored from the unit's
 `base_init.json`, only the counterfactual settings are new, and the old dirs are backed up
 under `<data root>/_redo_backup/`. Unit-level problems (e.g. a failed wrist mount) cannot
 be repaired this way; `scripts/quarantine.py` moves whatever still fails after a redo out of
-the dataset tree (`<data root>/_quarantine/`, reversible), since the SyncWorld loader walks
-the tree and has no exclude list.
+the dataset tree (`<data root>/_quarantine/`, reversible), so loaders that walk the tree
+never see it.
