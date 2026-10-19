@@ -11,8 +11,8 @@ here via planned-then-retimed paths).
 Grippers stay open (RoboTwin opens both during scene init) and are never actuated, so the
 clip never contains a gripper event.
 
-Unlike robocasa, `move_range.json` records the exact FRAME span of every leg, so the SyncWorld
-segment extractor does not have to rediscover the "strongest signed run" from pose deltas.
+Unlike robocasa, `move_range.json` records the exact FRAME span of every leg, so downstream code
+does not have to rediscover each leg from pose deltas.
 """
 
 import numpy as np
@@ -150,8 +150,7 @@ def render_clean(rollout, mr):
     The probe pass (`record_calibration` on an unrendered rollout) may have tried a leg
     several times (sign flip / shrink after a tracking failure, e.g. y- or z- toward the table
     or the robot body); in robocasa's terms those are motions the clip must not contain,
-    because SyncWorld's segment extraction looks for the strongest single-DoF run per signed
-    DoF. Every failed attempt returns to (within ~mm of) its start pose, so the accepted
+    because a stray single-DoF motion would be mistaken for a leg. Every failed attempt returns to (within ~mm of) its start pose, so the accepted
     segments chain up as absolute joint targets with only a mm-level correction."""
     c = mr.pop("_clean")
     if c["warmup"] is not None:
