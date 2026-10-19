@@ -122,8 +122,8 @@ partial or off-axis motion. Before this, 90 % of clips contained 1–4 rejected 
 **Rotations pivot at the gripper centre.** RoboTwin's end-effector point sits 0.12 m behind
 the gripper centre; rotating about it moves the gripper centre 3–4 cm per 20°, which in the
 recorded (gripper-centre) actions makes a roll leg look like a translation too. Legs and
-scripted counterfactual motions therefore rotate about the gripper centre (filmed drift
-≤ 5 mm).
+scripted counterfactual motions therefore rotate about the gripper centre (filmed drift over
+the 10,590 rotation legs of the full dataset: < 2 mm in 99 %, 6.4 mm at most).
 
 `move_range.json` records the exact out/back **frame spans** of every leg, so the SyncWorld
 segment extractor can read them instead of rediscovering "the strongest signed run" from
