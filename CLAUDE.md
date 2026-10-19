@@ -30,7 +30,6 @@ scripts/gen.sbatch        one array task: runs gen_set.sh for its (set, task par
 scripts/verify_set.py     audit a generated set without re-simulating; --exclude_out, --dark_scan
 scripts/watch_validate.sh validate each task as soon as it finishes (-> <data>/_validate.log)
 scripts/dataset_stats.py  yield / camera / calibration / counterfactual stats for a data root
-scripts/export_singlearm.py one-arm export for SyncWorld's stock (single-arm) loader
 scripts/redo_cf.sh        regenerate the counterfactuals in a verify_set exclude list
 scripts/quarantine.py     move what still fails out of the dataset tree (reversible)
 ```
