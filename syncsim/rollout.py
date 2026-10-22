@@ -9,14 +9,19 @@ RoboTwin tasks LATCH success mid-episode -- click_bell / click_alarmclock set
 `play_once` calls `check_success()` at that moment. A replay that only checks at the end
 would see the gripper already gone and report failure for every seed; polling every frame
 reproduces the latch. `success()` reports both the final verdict and whether / when the task
-was ever successful."""
+was ever successful.
+
+`contacts` (a contacts.ContactTracker built on the same freshly set-up task) is fed every
+physics step and closes a frame in step with the recorder, so its arrays align with the
+rollout's video frames."""
 
 from .rt_env import ControlStream, apply_step
 
 
 class Rollout:
 
-    def __init__(self, task, recorder, frame_stride, render=True, poll_success=False):
+    def __init__(self, task, recorder, frame_stride, render=True, poll_success=False,
+                 contacts=None):
         self.task = task
         self.rec = recorder
         self.stride = int(frame_stride)
@@ -26,6 +31,7 @@ class Rollout:
         self.marks = []                      # (label, physics step) annotations
         self.poll_success = poll_success
         self.success_frames = []
+        self.contacts = contacts
         if recorder is not None:
             recorder.capture(0, render=render)
 
@@ -44,7 +50,11 @@ class Rollout:
             apply_step(robot, seg, i)
             scene.step()
             self.n += 1
+            if self.contacts is not None:
+                self.contacts.after_step()
             if self.n % self.stride == 0:
+                if self.contacts is not None:
+                    self.contacts.end_frame()
                 if self.rec is not None:
                     self.rec.capture(self.n, render=self.render)
                 if self.poll_success:
