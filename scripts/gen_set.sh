@@ -71,10 +71,13 @@ REPO="$(cd "${SCRIPT_DIR}/.." && pwd)"
 : "${CALIB_ROT_SPEED_DPS:=20}"          # 12-20 deg in ~12-21 frames, like the translations
 # counterfactuals
 : "${NUM_CF:=4}"
-: "${CF_MODE_PROBS:=noisy_replay:0.35,scripted_diverge:0.3,freeze_arm:0.2,gripper_flip:0.15}"
+: "${CF_MODE_PROBS:=noisy_replay:0.2,scripted_diverge:0.2,freeze_arm:0.2,gripper_flip:0.15,grasp_miss:0.25}"
 : "${CF_ARM_PROBS:=left:0.35,right:0.35,both:0.3}"
 : "${CF_MIN_TCP_DEVIATION_M:=0.05}"
-: "${NOISE_SIGMA_RAD:=0.12}"
+: "${NOISE_SIGMA_RAD:=0.12}"           # NOISE_SPACE=joint only (v1)
+: "${NOISE_SPACE:=tcp}"               # tcp (bounded TCP offsets) | joint (v1 random walk)
+: "${CF_FOCUS_PROB:=0.7}"             # edit points near expert grasps/contacts (density knob)
+: "${RECORD_CONTACTS:=true}"
 
 SEED_START=$(( SEED_BASE + SET_ID * SEEDS_PER_SET ))
 SET_DIR="${OUTPUT_BASE}/set_${SET_ID}"
@@ -108,7 +111,8 @@ build_args() {
     --calib_rot_speed_dps "${CALIB_ROT_SPEED_DPS}"
     --num_counterfactuals "${NUM_CF}" --cf_mode_probs "${CF_MODE_PROBS}"
     --cf_arm_probs "${CF_ARM_PROBS}" --cf_min_tcp_deviation_m "${CF_MIN_TCP_DEVIATION_M}"
-    --noise_sigma_rad "${NOISE_SIGMA_RAD}")
+    --noise_sigma_rad "${NOISE_SIGMA_RAD}" --noise_space "${NOISE_SPACE}"
+    --cf_focus_prob "${CF_FOCUS_PROB}" --record_contacts "${RECORD_CONTACTS}")
   [[ -n "${EMBODIMENT}" ]] && ARGS+=(--embodiment "${EMBODIMENT}")
   [[ -n "${RANDOM_BACKGROUND}" ]] && ARGS+=(--random_background "${RANDOM_BACKGROUND}")
   [[ -n "${CLUTTERED_TABLE}" ]] && ARGS+=(--cluttered_table "${CLUTTERED_TABLE}")
