@@ -57,6 +57,7 @@ class Config:
     rt_denoiser: str = "optix"               # RoboTwin's "oidn" fails on Blackwell GPUs ("invalid handle")
     video_crf: int = 18
     record_wrist: bool = True
+    record_contacts: bool = True             # contacts.npz + contacts.json per rollout (syncsim/contacts.py)
     # ---- RoboTwin domain randomisation overrides (None = keep the task config's) -------
     random_background: str = ""              # "", "true", "false"
     cluttered_table: str = ""
@@ -102,11 +103,16 @@ class Config:
     calib_max_spurious_trans_m: float = 0.03 # ... or a rotation leg translates more than this
     # ---- counterfactuals --------------------------------------------------------------------
     num_counterfactuals: int = 4
-    cf_mode_probs: str = "noisy_replay:0.35,scripted_diverge:0.3,freeze_arm:0.2,gripper_flip:0.15"
+    cf_mode_probs: str = ("noisy_replay:0.2,scripted_diverge:0.2,freeze_arm:0.2,gripper_flip:0.15,"
+                          "grasp_miss:0.25")
     cf_arm_probs: str = "left:0.35,right:0.35,both:0.3"
     cf_min_tcp_deviation_m: float = 0.05
     cf_min_rot_deviation_deg: float = 10.0   # ... or a gripper ROTATES this far from the expert's
     cf_min_gripper_mismatch_frac: float = 0.05
+    cf_min_object_deviation_m: float = 0.03  # ... or an object ends up this far from the expert's
+    cf_focus_prob: float = 0.7               # edit point drawn near an expert interaction (density knob)
+    cf_focus_pre_frames: int = 20            # "near" = this many frames before ...
+    cf_focus_post_frames: int = 8            # ... to this many after a grasp / release / contact onset
     cf_max_tcp_speed_mps: float = 1.0        # plausibility: no TCP faster than this ...
     cf_expert_speed_margin: float = 1.5      # ... unless the expert itself is (then 1.5x its peak)
     cf_max_attempts: int = 3
@@ -114,11 +120,17 @@ class Config:
     cf_min_prefix_frames: int = 4
     cf_min_suffix_frames: int = 24
     freeze_min_remaining_m: float = 0.08     # freeze_arm breakpoint: frozen TCP must still travel this far
-    noise_sigma_rad: float = 0.12
+    noise_space: str = "tcp"                 # tcp (bounded TCP offsets) | joint (v1 joint random walk)
+    noise_tcp_sigma_m: float = 0.025         # per noise point, per axis
+    noise_max_offset_m: float = 0.06         # accumulated TCP offset is capped here (x escalation)
+    noise_sigma_rad: float = 0.12            # noise_space=joint only
     noise_wrist_scale: float = 0.6
     noise_interval_frames: int = 10          # ramp half-width
     noise_points_per_100_frames: float = 2.0
     noise_persist: bool = True
+    grasp_miss_m: tuple = (0.025, 0.06)      # approach shifted this far from the expert's grasp
+    grasp_miss_vertical_prob: float = 0.25   # ... upward (closing above the object) vs sideways
+    grasp_miss_approach_frames: int = 15     # offset ramps in over the last frames before the close
     flip_lo_frac: float = 0.25
     flip_hi_frac: float = 0.85
     diverge_two_segment_prob: float = 0.5
@@ -197,20 +209,23 @@ def _freeze_frames(cfg, expert_tcp, arm):
             if np.linalg.norm(tcp[f:] - tcp[f], axis=1).max() >= cfg.freeze_min_remaining_m]
 
 
-def _freeze_breakpoint(rng, cfg, expert_tcp, arm_pref):
+def _freeze_breakpoint(rng, cfg, expert_tcp, arm_pref, focus=()):
     """(arm, breakpoint step) for freeze_arm, preferring `arm_pref`; ValueError if neither arm
     has a frame where freezing it diverges."""
+    from .counterfactual import focus_filter
     order = [arm_pref] + [a for a in ("left", "right") if a != arm_pref]
     for arm in order:
         frames = _freeze_frames(cfg, expert_tcp, arm)
         if frames:
+            frames, _ = focus_filter(rng, cfg, frames, focus)
             return arm, int(rng.choice(frames)) * cfg.frame_stride
     raise ValueError("freeze_arm: no arm moves enough after any admissible breakpoint")
 
 
 _REDO_SCENE_KEYS = ("task", "task_config", "embodiment", "random_background", "cluttered_table",
                     "random_light", "random_table_height")
-_REDO_NEW_PREFIXES = ("cf_", "noise_", "flip_", "diverge_", "freeze_", "num_counterfactuals",
+_REDO_NEW_PREFIXES = ("cf_", "noise_", "flip_", "diverge_", "freeze_", "grasp_miss_",
+                      "num_counterfactuals", "record_contacts",
                       "redo_", "output_dir", "overwrite", "seed_start", "num_seeds",
                       "max_episodes")
 
@@ -260,6 +275,9 @@ class Generator:
         os.makedirs(self.task_dir, exist_ok=True)
         self.dropped_path = os.path.join(self.task_dir, "_dropped.json")
         self.dropped = {}
+        # the current unit's expert, as counterfactuals need it: object track (for the object
+        # divergence gate) and interaction frames (for cf_focus_prob)
+        self._expert_obj, self._obj_names, self._focus = None, None, []
         if os.path.exists(self.dropped_path) and not cfg.overwrite:
             with open(self.dropped_path) as f:
                 self.dropped = {int(k): v for k, v in json.load(f).items()}
@@ -286,6 +304,30 @@ class Generator:
         return RigRecorder(self.task, _rig_for_recorder(rig, self.cfg), self.cfg.image_size,
                            self.cfg.image_size, shader=self.cfg.shader,
                            record_wrist=self.cfg.record_wrist)
+
+    def _tracker(self):
+        """A ContactTracker on the freshly reset task (create it before the Rollout)."""
+        if not self.cfg.record_contacts:
+            return None
+        from .contacts import ContactTracker
+        return ContactTracker(self.task, self.cfg.frame_stride)
+
+    def _save_contacts(self, tr, rec, out_dir):
+        if tr is None:
+            return None
+        return tr.save(out_dir, object_poses=np.asarray(rec.log["objects"]),
+                       object_names=[e.get_name() for e in rec.actors], extra={"source": "live"})
+
+    def _set_expert(self, stream, obj_track, obj_names, contacts=None):
+        from .contacts import ROBOT_OBJECT_KINDS
+        from . import counterfactual as CF
+        self._expert_obj = None if obj_track is None else np.asarray(obj_track)
+        self._obj_names = None if obj_names is None else [str(n) for n in obj_names]
+        onsets = []
+        if contacts:
+            onsets = [w["start"] for w in contacts["windows"]
+                      if w["started"] == "rollout" and w["kind"] in ROBOT_OBJECT_KINDS]
+        self._focus = CF.focus_frames(stream, self.cfg.frame_stride, onsets)
 
     @property
     def fps(self):
@@ -380,6 +422,10 @@ class Generator:
             expert_quat = np.stack([np.roll(P[f"{a}_gripper_pose"][:, 3:7], 1, axis=1)
                                     for a in arms], axis=1)                  # xyzw -> wxyz
             expert_g = np.stack([P[f"{a}_gripper_open"] for a in arms], axis=1)
+            z = np.load(os.path.join(unit, "expert", "object_poses.npz"))
+            cpath = os.path.join(unit, "expert", "contacts.json")
+            self._set_expert(stream, z["poses"], z["names"],
+                             json.load(open(cpath)) if os.path.exists(cpath) else None)
             backup = os.path.join(backup_root, os.path.relpath(cf_dir, set_dir))
             os.makedirs(os.path.dirname(backup), exist_ok=True)
             if os.path.exists(backup):
@@ -460,7 +506,8 @@ class Generator:
         # ---- expert -------------------------------------------------------------------
         reset()
         rec = self._recorder(rig)
-        ro = Rollout(self.task, rec, cfg.frame_stride, poll_success=True)
+        tr = self._tracker()
+        ro = Rollout(self.task, rec, cfg.frame_stride, poll_success=True, contacts=tr)
         ro.run(stream)
         succ = ro.success()
         expert_success = succ["final"]
@@ -471,6 +518,8 @@ class Generator:
         exp_dir = os.path.join(unit, "expert")
         n_frames = rec.save(exp_dir, self.fps, cfg.frame_stride, crf=cfg.video_crf)
         expert_tcp, expert_g, expert_quat = rec.tcp_track(), rec.gripper_track(), rec.quat_track()
+        self._set_expert(stream, rec.log["objects"], [e.get_name() for e in rec.actors],
+                         self._save_contacts(tr, rec, exp_dir))
         write_json(os.path.join(exp_dir, "metadata.json"), {
             "episode_type": "expert", "seed": seed, "task": cfg.task, "success": expert_success,
             "first_success_frame": succ["first_frame"],
@@ -488,10 +537,12 @@ class Generator:
             mr = record_calibration(probe, _unit_rng(cfg, seed, m, "calibration"), cfg)
             reset()
             rec = self._recorder(rig)
-            ro = Rollout(self.task, rec, cfg.frame_stride)
+            tr = self._tracker()
+            ro = Rollout(self.task, rec, cfg.frame_stride, contacts=tr)
             render_clean(ro, mr)
             cal_dir = os.path.join(unit, "calibration")
             mr["frames"] = rec.save(cal_dir, self.fps, cfg.frame_stride, crf=cfg.video_crf)
+            self._save_contacts(tr, rec, cal_dir)
             mr["filmed"] = _filmed_leg_motion(rec, mr)
             ro.stream().save(os.path.join(cal_dir, "stream.npz"))
             write_json(os.path.join(cal_dir, "move_range.json"), mr)
@@ -541,11 +592,24 @@ class Generator:
                 "escalation": esc}
         if mode == "noisy_replay":
             s, info = CF.noisy_replay(stream, arng, cfg, CF.arms_of(arm_sel), esc,
-                                      cfg.frame_stride, dt)
+                                      cfg.frame_stride, dt, robot=self.task.robot,
+                                      focus=self._focus)
             ro.run(s)
             meta["noise"] = info
+        elif mode == "grasp_miss":
+            # the chosen arm must grasp somewhere in the expert; else the other arm
+            for arm in [arm_sel] + [a for a in ("left", "right") if a != arm_sel]:
+                if CF.gripper_events(stream, arm)["close"]:
+                    break
+            meta["arms"] = arm_sel = arm
+            s, info = CF.grasp_miss(stream, arng, cfg, arm, esc, cfg.frame_stride, dt,
+                                    self.task.robot)
+            meta["breakpoint_frame"] = max(0, info["close_frame"] - cfg.grasp_miss_approach_frames)
+            ro.run(s)
+            meta["grasp_miss"] = info
         elif mode == "gripper_flip":
-            s, info = CF.gripper_flip(stream, arng, cfg, arm_sel, cfg.frame_stride)
+            s, info = CF.gripper_flip(stream, arng, cfg, arm_sel, cfg.frame_stride,
+                                      focus=self._focus)
             ro.run(s)
             meta["flip"] = info
         elif mode == "freeze_arm":
@@ -553,7 +617,7 @@ class Generator:
             # side, the other arm stays home; dump_bin_bigbin: late breakpoints after the last
             # motion) -- the breakpoint is drawn only where the frozen arm's TCP still has to
             # travel at least the divergence gate, and an arm with no such frame is swapped out
-            arm_sel, p = _freeze_breakpoint(arng, cfg, expert_tcp, arm_sel)
+            arm_sel, p = _freeze_breakpoint(arng, cfg, expert_tcp, arm_sel, self._focus)
             meta["arms"] = arm_sel
             meta["breakpoint_step"] = int(p)
             meta["breakpoint_frame"] = int(p // cfg.frame_stride)
@@ -563,14 +627,16 @@ class Generator:
             meta["freeze"] = info
         else:
             p = CF.sample_breakpoint(arng, stream.n, cfg.frame_stride,
-                                     cfg.cf_min_prefix_frames, cfg.cf_min_suffix_frames)
+                                     cfg.cf_min_prefix_frames, cfg.cf_min_suffix_frames,
+                                     cfg=cfg, focus=self._focus)
             meta["breakpoint_step"] = int(p)
             meta["breakpoint_frame"] = int(p // cfg.frame_stride)
             ro.run(stream.slice(0, p))
             meta["scripted"] = CF.scripted_suffix(ro, arng, cfg, CF.arms_of(arm_sel), esc)
         executed = ro.stream()
         div = CF.divergence(expert_tcp, ro.rec.tcp_track(), expert_g, ro.rec.gripper_track(),
-                            expert_quat, ro.rec.quat_track())
+                            expert_quat, ro.rec.quat_track(), self._expert_obj,
+                            ro.rec.obj_track(), self._obj_names)
         speed = CF.tcp_speed(ro.rec.tcp_track(), self.fps)
         peak = max(v["peak_mps"] for v in speed.values())
         div.update({"tcp_speed": speed, "peak_tcp_speed_mps": peak,
@@ -579,7 +645,8 @@ class Generator:
         div["diverging_arms"] = [a for a in ("left", "right") if self._arm_diverged(div.get(a, {}))]
         diverged = (div.get("max_tcp_m", 0) >= cfg.cf_min_tcp_deviation_m
                     or div.get("max_rot_deg", 0) >= cfg.cf_min_rot_deviation_deg
-                    or div.get("gripper_mismatch_frac", 0) >= cfg.cf_min_gripper_mismatch_frac)
+                    or div.get("gripper_mismatch_frac", 0) >= cfg.cf_min_gripper_mismatch_frac
+                    or div.get("max_object_m", 0) >= cfg.cf_min_object_deviation_m)
         return executed, meta, div, bool(diverged and div["plausible"])
 
     def _arm_diverged(self, d):
@@ -602,8 +669,11 @@ class Generator:
         rng = _unit_rng(cfg, seed, m, f"cf{k}")
         mode = CF.pick(rng, _parse_probs(cfg.cf_mode_probs))
         arm_sel = CF.pick(rng, _parse_probs(cfg.cf_arm_probs))
-        if mode in ("freeze_arm", "gripper_flip") and arm_sel == "both":
+        if mode in ("freeze_arm", "gripper_flip", "grasp_miss") and arm_sel == "both":
             arm_sel = "left" if rng.random() < 0.5 else "right"
+        if mode == "grasp_miss" and not any(CF.gripper_events(stream, a)["close"]
+                                            for a in ("left", "right")):
+            mode = "noisy_replay"       # the expert never grasps (click_bell, press_stapler)
         if mode == "freeze_arm" and not any(_freeze_frames(cfg, expert_tcp, a)
                                             for a in ("left", "right")):
             mode = "noisy_replay"       # nothing left to freeze in this expert
@@ -651,12 +721,14 @@ class Generator:
         # ---- render the accepted (or most divergent) executed stream exactly -------------
         self._reset(seed)
         rec = self._recorder(rig)
-        ro = Rollout(self.task, rec, cfg.frame_stride, poll_success=True)
+        tr = self._tracker()
+        ro = Rollout(self.task, rec, cfg.frame_stride, poll_success=True, contacts=tr)
         ro.run(executed)
         succ = ro.success()
         success = succ["final"]
         cf_dir = os.path.join(unit, f"counterfactual_{k:03d}")
         n_frames = rec.save(cf_dir, self.fps, cfg.frame_stride, crf=cfg.video_crf)
+        self._save_contacts(tr, rec, cf_dir)
         executed.save(os.path.join(cf_dir, "stream.npz"))
         meta.update({"episode_type": "counterfactual", "k": k, "seed": seed,
                      "task_success": success, "task_success_ever": succ["ever"],
@@ -693,8 +765,10 @@ class _TrackOnly:
     """Recorder stand-in for unrendered probe rollouts: logs TCPs + grippers only."""
 
     def __init__(self, task):
+        from .recorder import dynamic_actors
         self.robot = task.robot
-        self.tcp, self.q, self.g = [], [], []
+        self.actors = dynamic_actors(task.scene)     # same order as RigRecorder's on this scene
+        self.tcp, self.q, self.g, self.obj = [], [], [], []
 
     def capture(self, step_idx, render=False):
         r = self.robot
@@ -702,6 +776,7 @@ class _TrackOnly:
         self.tcp.append([lp[:3], rp[:3]])
         self.q.append([lp[3:7], rp[3:7]])
         self.g.append([r.left_gripper_val, r.right_gripper_val])
+        self.obj.append([np.asarray(e.get_pose().p, dtype=np.float64) for e in self.actors])
 
     def tcp_track(self):
         return np.asarray(self.tcp, dtype=np.float64)
@@ -711,6 +786,9 @@ class _TrackOnly:
 
     def quat_track(self):
         return np.asarray(self.q, dtype=np.float64)          # wxyz, like RigRecorder's
+
+    def obj_track(self):
+        return np.asarray(self.obj, dtype=np.float64).reshape(len(self.obj), len(self.actors), 3)
 
 
 def main(argv=None):
