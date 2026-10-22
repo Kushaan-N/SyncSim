@@ -3,11 +3,21 @@
 Every counterfactual starts from the expert's seeded initial scene and differs from the expert
 in its CONTROLS only. Modes (one per counterfactual index, drawn with `cf_mode_probs`):
 
-  noisy_replay     the expert control stream with sparse, smooth JOINT-SPACE perturbations
-                   on one arm, the other, or both (`cf_arm_probs`). By default the offsets
-                   PERSIST after their ramp (`noise_persist`), the joint-space analogue of
-                   robocasa's integrating OSC deltas -- a pure bump would let the arm snap
-                   back to the expert path. (Gripper flips are their own mode, below.)
+  noisy_replay     the expert control stream with sparse, smooth perturbations on one arm, the
+                   other, or both (`cf_arm_probs`). `noise_space=tcp` (default): each point
+                   adds a random TCP offset (`noise_tcp_sigma_m`) at fixed gripper
+                   orientation, mapped to joints by taskspace.py, and the accumulated offset is
+                   capped at `noise_max_offset_m` -- an imprecise arm, not a wandering one.
+                   `noise_space=joint` is the v1 behaviour: raw joint offsets, which persist
+                   and add up (a random walk: median 16 cm, 11% beyond 30 cm in v1). Offsets
+                   PERSIST after their ramp (`noise_persist`), the analogue of robocasa's
+                   integrating OSC deltas. (Gripper flips are their own mode, below.)
+  grasp_miss       one of the expert's grasps (a gripper-close command) is approached with the
+                   TCP shifted `grasp_miss_m` sideways (or, with `grasp_miss_vertical_prob`,
+                   upward), ramped in over the approach and kept: the fingers close beside or
+                   above the object, or catch it off-centre -- a missed or bad grasp, the most
+                   common real manipulation failure, made by a small offset rather than by
+                   moving the arm somewhere unrelated.
   scripted_diverge expert prefix to a breakpoint, then 1-2 scripted end-effector motions
                    planned LIVE from the breakpoint state for the chosen arm(s); the other
                    arm (if not chosen) and both grippers HOLD their breakpoint command
@@ -21,6 +31,16 @@ in its CONTROLS only. Modes (one per counterfactual index, drawn with `cf_mode_p
                    second hand never arrives) without either arm doing anything unnatural.
   gripper_flip     the expert stream with one arm's gripper command inverted from a sampled
                    step to the end: a premature release / an unwanted grasp.
+
+Interaction focus: with probability `cf_focus_prob` the edit point of a mode (breakpoint,
+flip step, noise points) is drawn near an interaction of the expert -- a gripper close or open,
+or the start of a robot-object contact when contacts are recorded -- instead of uniformly
+over the episode, so the edit changes WHAT HAPPENS TO AN OBJECT rather than an arm moving
+through free space. This is the knob for how interaction-dense the counterfactuals are.
+
+Divergence also counts the world: a counterfactual whose objects end up >=
+`cf_min_object_deviation_m` from where the expert's do has diverged even if the arm is
+within the TCP gate (a 3 cm grasp miss that leaves the block on the table).
 
 Robocasa lessons kept:
   * a perturbation that does not visibly change anything is useless -> every rollout is
@@ -48,7 +68,7 @@ from .motion import (ROT_DOFS, TRANS_DOFS, arm_segment, displaced_pose, ee_pose,
                      retime)
 from .rt_env import ControlStream, current_targets
 
-MODES = ("noisy_replay", "scripted_diverge", "freeze_arm", "gripper_flip")
+MODES = ("noisy_replay", "scripted_diverge", "freeze_arm", "gripper_flip", "grasp_miss")
 
 
 def pick(rng, probs: dict):
@@ -61,14 +81,46 @@ def arms_of(sel):
     return ["left", "right"] if sel == "both" else [sel]
 
 
-def sample_breakpoint(rng, n_steps, frame_stride, min_prefix_frames, min_suffix_frames):
+def sample_breakpoint(rng, n_steps, frame_stride, min_prefix_frames, min_suffix_frames,
+                      cfg=None, focus=()):
     lo = min_prefix_frames * frame_stride
     hi = n_steps - min_suffix_frames * frame_stride
     if hi <= lo:
         lo, hi = 0, max(1, n_steps // 2)
     # breakpoints sit on frame boundaries so "frame index of the divergence" is exact
-    p = int(rng.integers(lo, hi))
-    return (p // frame_stride) * frame_stride
+    frames = range(-(-lo // frame_stride), max(-(-lo // frame_stride) + 1, hi // frame_stride))
+    if cfg is not None:
+        frames, _ = focus_filter(rng, cfg, frames, focus)
+    return int(rng.choice(list(frames))) * frame_stride
+
+
+def gripper_events(stream, arm):
+    """Physics steps where `arm`'s gripper command closes (open -> closed) and opens."""
+    g = np.round(np.asarray(stream[f"{arm}_g"], dtype=np.float64))
+    d = np.diff(g)
+    return {"close": (np.flatnonzero(d < 0) + 1).tolist(), "open": (np.flatnonzero(d > 0) + 1).tolist()}
+
+
+def focus_frames(stream, frame_stride, contact_onsets=()):
+    """Video frames at which the expert interacts: gripper closes/opens of either arm, plus
+    any recorded robot-object contact onsets (frames)."""
+    out = set(int(f) for f in contact_onsets)
+    for arm in ("left", "right"):
+        ev = gripper_events(stream, arm)
+        out.update(int(st // frame_stride) for st in ev["close"] + ev["open"])
+    return sorted(out)
+
+
+def focus_filter(rng, cfg, candidates, focus):
+    """With probability cf_focus_prob, keep only the candidate frames within
+    [-cf_focus_pre_frames, +cf_focus_post_frames] of a focus frame (if any are)."""
+    candidates = list(candidates)
+    if not focus or not candidates or rng.random() >= cfg.cf_focus_prob:
+        return candidates, False
+    f = np.asarray(focus)
+    near = [c for c in candidates
+            if np.any((c >= f - cfg.cf_focus_pre_frames) & (c <= f + cfg.cf_focus_post_frames))]
+    return (near, True) if near else (candidates, False)
 
 
 # ----------------------------------------------------------------------------------------
@@ -79,12 +131,15 @@ def _smooth_step(t):
     return t * t * (3 - 2 * t)
 
 
-def noisy_replay(stream, rng, cfg, arms, escalation, frame_stride, dt):
+def noisy_replay(stream, rng, cfg, arms, escalation, frame_stride, dt, robot=None, focus=()):
+    if cfg.noise_space == "tcp":
+        return _noisy_tcp(stream, rng, cfg, arms, escalation, frame_stride, dt, robot, focus)
     s = stream.copy()
     n = s.n
     dt_frames = cfg.noise_interval_frames * frame_stride       # ramp half-width in steps
     info = {"arms": arms, "points": {}, "sigma_rad": cfg.noise_sigma_rad * escalation,
-            "persist": bool(cfg.noise_persist), "interval_frames": cfg.noise_interval_frames}
+            "space": "joint", "persist": bool(cfg.noise_persist),
+            "interval_frames": cfg.noise_interval_frames}
     for arm in arms:
         q = s[f"{arm}_q"]
         d = q.shape[1]
@@ -110,11 +165,90 @@ def noisy_replay(stream, rng, cfg, arms, escalation, frame_stride, dt):
     return s, info
 
 
-def gripper_flip(stream, rng, cfg, arm, frame_stride):
+def _noisy_tcp(stream, rng, cfg, arms, escalation, frame_stride, dt, robot, focus):
+    from .taskspace import ArmKinematics, apply_joint_ramps, bound_ramps, solve_offset
+    s = stream.copy()
+    n = s.n
+    F = n // frame_stride + 1
+    half = cfg.noise_interval_frames
+    cap = cfg.noise_max_offset_m * escalation
+    info = {"arms": arms, "points": {}, "space": "tcp",
+            "sigma_m": cfg.noise_tcp_sigma_m * escalation, "cap_m": cap,
+            "persist": bool(cfg.noise_persist), "interval_frames": half}
+    t = np.arange(n, dtype=np.float64)
+    hs = half * frame_stride
+    for arm in arms:
+        kin = ArmKinematics(robot, arm)
+        q = np.asarray(s[f"{arm}_q"], dtype=np.float64)
+        k = max(1, int(round(cfg.noise_points_per_100_frames * F / 100.0)))
+        cands, focused = focus_filter(rng, cfg, range(half, max(half + 1, F - half)), focus)
+        pts = sorted(rng.choice(cands, size=min(k, len(cands)), replace=False).tolist())
+        total = np.zeros(3)                       # intended accumulated TCP offset
+        acc = np.zeros(q.shape[1])                # joint offset already ramped in
+        ramps, deltas, resid = [], [], []
+        for p in pts:
+            delta = rng.normal(0.0, cfg.noise_tcp_sigma_m * escalation, size=3)
+            new = total + delta
+            new *= min(1.0, cap / max(np.linalg.norm(new), 1e-9))   # bounded, direction kept
+            delta = new - total
+            st = min(p * frame_stride, n - 1)
+            try:
+                dq, done, r = solve_offset(kin, q[st] + acc, delta)
+            except ValueError:
+                continue                          # skip a point at a near-singular pose
+            if cfg.noise_persist:
+                w = _smooth_step((t - (st - hs)) / (2.0 * hs))
+            else:
+                w = np.clip(1.0 - np.abs(t - st) / hs, 0.0, None)
+            ramps.append((dq, w))
+            acc = acc + dq if cfg.noise_persist else acc
+            total = total + done if cfg.noise_persist else total
+            deltas.append(done.tolist())
+            resid.append(r)
+        ramps, eff, scale = bound_ramps(kin, q, ramps, cap, frame_stride)
+        s = apply_joint_ramps(s, arm, ramps, dt)
+        info["points"][arm] = {"frames": pts, "deltas_m": deltas, "focused": focused,
+                               "planned_offset_m": float(np.linalg.norm(total)),
+                               "kinematic_effect_m": eff, "scale": scale,
+                               "ik_max_residual_m": float(max(resid)) if resid else 0.0}
+    return s, info
+
+
+def grasp_miss(stream, rng, cfg, arm, escalation, frame_stride, dt, robot):
+    """Shift `arm`'s approach to one of its grasps; ValueError if the arm never grasps."""
+    from .taskspace import (ArmKinematics, apply_joint_ramps, bound_ramps, smooth_ramp,
+                            solve_offset)
+    closes = gripper_events(stream, arm)["close"]
+    if not closes:
+        raise ValueError(f"grasp_miss: {arm} never closes its gripper")
+    c = int(rng.choice(closes))
+    if rng.random() < cfg.grasp_miss_vertical_prob:
+        direction = np.array([0.0, 0.0, 1.0])
+    else:
+        a = rng.uniform(0, 2 * np.pi)
+        direction = np.array([np.cos(a), np.sin(a), 0.0])
+    mag = rng.uniform(*cfg.grasp_miss_m) * escalation
+    kin = ArmKinematics(robot, arm)
+    dq, done, resid = solve_offset(kin, np.asarray(stream[f"{arm}_q"])[c], mag * direction)
+    a0 = c - cfg.grasp_miss_approach_frames * frame_stride
+    w = smooth_ramp(stream.n, a0, c - 2 * frame_stride)
+    ramps, eff, scale = bound_ramps(kin, np.asarray(stream[f"{arm}_q"], dtype=np.float64),
+                                    [(dq, w)], 1.5 * float(np.linalg.norm(done)), frame_stride)
+    s = apply_joint_ramps(stream, arm, ramps, dt)
+    return s, {"kinematic_effect_m": eff, "scale": scale,"arm": arm, "close_step": c, "close_frame": int(c // frame_stride),
+               "offset_m": done.tolist(), "magnitude_m": float(np.linalg.norm(done)),
+               "vertical": bool(direction[2] > 0), "ramp_frames": cfg.grasp_miss_approach_frames,
+               "joint_offset_rad": np.asarray(dq).round(4).tolist(),
+               "ik_residual_m": float(resid)}
+
+
+def gripper_flip(stream, rng, cfg, arm, frame_stride, focus=()):
     s = stream.copy()
     n = s.n
     lo = int(cfg.flip_lo_frac * n); hi = max(lo + 1, int(cfg.flip_hi_frac * n))
-    q = int(rng.integers(lo, hi))
+    frames, _ = focus_filter(rng, cfg, range(lo // frame_stride, max(lo // frame_stride + 1,
+                                                                     hi // frame_stride)), focus)
+    q = int(rng.choice(frames)) * frame_stride
     g = s[f"{arm}_g"]
     g[q:] = 1.0 - np.round(g[q:])          # open <-> closed
     s[f"{arm}_geps"][q:] = np.maximum(s[f"{arm}_geps"][q:], 0.1)
@@ -236,9 +370,11 @@ def tcp_speed(tcp, fps):
             for j, a in enumerate(("left", "right"))}
 
 
-def divergence(expert_tcp, cf_tcp, expert_g, cf_g, expert_quat=None, cf_quat=None):
+def divergence(expert_tcp, cf_tcp, expert_g, cf_g, expert_quat=None, cf_quat=None,
+               expert_obj=None, cf_obj=None, obj_names=None):
     """expert_tcp/cf_tcp [T, 2, 3]; expert_g/cf_g [T, 2] gripper commands; optional
-    expert_quat/cf_quat [T, 2, 4] TCP orientations (same component order in both)."""
+    expert_quat/cf_quat [T, 2, 4] TCP orientations (same component order in both); optional
+    expert_obj/cf_obj [T, O, >=3] object positions (same object order in both)."""
     n = min(len(expert_tcp), len(cf_tcp))
     if n == 0:
         return {"n_compared": 0}
@@ -252,6 +388,14 @@ def divergence(expert_tcp, cf_tcp, expert_g, cf_g, expert_quat=None, cf_quat=Non
     if expert_quat is not None and cf_quat is not None:
         r = quat_angle_deg(np.asarray(expert_quat[:n]), np.asarray(cf_quat[:n]))      # [n, 2]
         out["max_rot_deg"] = float(r.max())
+    if expert_obj is not None and cf_obj is not None and np.size(expert_obj) and np.size(cf_obj):
+        eo, co = np.asarray(expert_obj)[:n, :, :3], np.asarray(cf_obj)[:n, :, :3]
+        if eo.shape == co.shape:
+            od = np.linalg.norm(eo - co, axis=2)                                         # [n, O]
+            out["max_object_m"] = float(od.max())
+            out["final_object_m"] = float(od[-1].max())
+            j = int(od.max(axis=0).argmax())
+            out["most_diverged_object"] = str(obj_names[j]) if obj_names is not None else j
     for j, arm in enumerate(("left", "right")):
         out[arm] = {"max_tcp_m": float(d[:, j].max()), "mean_tcp_m": float(d[:, j].mean()),
                     "gripper_mismatch_frac": float(gm[:, j].mean())}
