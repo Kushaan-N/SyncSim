@@ -121,7 +121,7 @@ rollout's saved control stream; checked against the stored object poses, videos 
 then build the interaction index and the distribution numbers per counterfactual mode:
 
 ```bash
-DATA_ROOT=data N_SHARDS=32 bash scripts/submit_contacts.sh
+DATA_ROOT=data N_SHARDS=48 bash scripts/submit_contacts.sh
 python scripts/contact_stats.py --data_root data --by_task
 python scripts/contact_stats.py --data_root data_v2 --compare data/contact_index.jsonl
 ```
