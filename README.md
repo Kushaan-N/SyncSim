@@ -28,11 +28,19 @@ two.
   recorded.
 * **Counterfactual episodes**, each checked to actually differ from the expert and to stay
   physically plausible (no end effector faster than 1 m/s):
-  * `noisy_replay`: smooth joint-space perturbations on the left, right, or both arms;
+  * `grasp_miss`: one of the expert's grasps approached a few cm off (sideways or above),
+    so the fingers close beside the object or catch it off-centre;
+  * `noisy_replay`: small, smooth end-effector offsets (capped at 6 cm) on the left, right,
+    or both arms -- an imprecise arm, not a wandering one;
   * `scripted_diverge`: the expert up to a breakpoint, then scripted end-effector motions;
   * `freeze_arm`: one arm stops, at a point where it still had somewhere to go, while the
     other continues, which breaks the two arms' coordination;
   * `gripper_flip`: one gripper opens or closes when it shouldn't.
+* **Contact ground truth**, per frame: which robot part (each gripper's fingers and body, each
+  arm, the base) touches which object, the table or the other arm, with force and contact
+  point; plus contact windows, grasp / hold windows, collisions the rollout caused, and how
+  far each touched object moved. Counterfactual edit points are drawn near the expert's
+  grasps and contacts (`cf_focus_prob`), so most of them change what happens to an object.
 * **Any two-arm embodiment RoboTwin supports**, including mixed pairs (e.g. a Piper left arm
   and a Franka right arm).
 
@@ -108,6 +116,20 @@ DATA_ROOT=data nohup bash scripts/watch_validate.sh &
 python scripts/dataset_stats.py --root data --json_out stats.json
 ```
 
+Add contact labels to a data root generated without them (an unrendered replay of every
+rollout's saved control stream; checked against the stored object poses, videos untouched),
+then build the interaction index and the distribution numbers per counterfactual mode:
+
+```bash
+DATA_ROOT=data N_SHARDS=32 bash scripts/submit_contacts.sh
+python scripts/contact_stats.py --data_root data --by_task
+python scripts/contact_stats.py --data_root data_v2 --compare data/contact_index.jsonl
+```
+
+`contact_index.jsonl` (one row per rollout) and `contact_events.jsonl` (one row per contact
+window) are the tables to sample training data from, e.g. every rollout with an arm-object
+collision, or every grasp that ended with the object dropped.
+
 ## Output
 
 ```
@@ -129,6 +151,9 @@ each rollout directory:
     actions.npy    [T,16]: per arm gripper-centre xyz, quat xyzw, opening (left 0:8, right 8:16)
     joints.npy     measured joint positions of both arms
     object_poses.npz   world pose of every movable object per frame
+    contacts.npz   per frame x part pair: touching share of the frame, impulse, contact point
+    contacts.json  contact windows (frame x to y, force, object motion during / after),
+                   held windows per arm, and a summary (interaction share, event counts)
 ```
 
 Defaults: 512×512 video at ~20.8 fps (physics at 250 Hz, a frame every 12 steps), two
