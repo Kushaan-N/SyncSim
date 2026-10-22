@@ -134,7 +134,8 @@ can cut out each leg directly instead of rediscovering it from pose deltas.
 
 | mode | what | robocasa analogue |
 |---|---|---|
-| `noisy_replay` | expert stream + smooth sparse **joint-space** offsets on left / right / both arms; offsets **persist** after their ramp (`noise_persist`) | `noisy_replay` (OSC deltas integrate, so robocasa offsets persisted too) |
+| `noisy_replay` | expert stream + smooth sparse **end-effector** offsets (`noise_tcp_sigma_m` per point, accumulated offset capped at `noise_max_offset_m`) on left / right / both arms; offsets **persist** after their ramp (`noise_persist`). `noise_space=joint` is the v1 joint-space version | `noisy_replay` (OSC deltas integrate, so robocasa offsets persisted too) |
+| `grasp_miss` | one of the arm's grasps (a gripper-close command) approached with the TCP shifted 2.5–6 cm sideways or upward, ramped in over the last 15 frames and kept | new — the commonest real manipulation failure, made by a small offset |
 | `scripted_diverge` | expert prefix → 1–2 scripted EE motions planned live for the chosen arm(s); unchosen arm + grippers **hold** | `scripted_diverge` with the opt-in `hold` gripper mode |
 | `freeze_arm` | from a breakpoint one arm holds while the other keeps executing the expert | new — bimanual only: breaks coordination (handover never happens) with natural motion |
 | `gripper_flip` | one arm's gripper command inverted from a sampled step to the end | `--cf_gripper_flip_prob` |
@@ -167,11 +168,57 @@ Robocasa lessons applied:
 * **Mix the task into seeds** (robocasa's `cf_task_seed_salt` fix): all RNG streams include
   the task name, seed, camera unit and a per-set salt.
 
+**Why v1's noisy replay was replaced.** Its offsets were raw joint angles (σ 0.12 rad per
+point) that persisted and added up: a random walk. A shoulder offset swings the whole arm, so
+the median v1 noisy counterfactual drifted 16 cm and 11 % drifted over 30 cm (up to 50 cm) --
+the arm wandered off with no purpose. Now each point is an end-effector offset at fixed
+gripper orientation, turned into a joint offset by IK at that frame (`taskspace.py`), and the
+total is capped. One IK solve per point, not one per frame: re-solving along the trajectory
+flipped IK branches near wrist singularities (0.5–0.9 rad jumps, 1–7 m/s TCP spikes). A
+constant joint offset can still move the TCP further at another pose, so its effect is
+checked by forward kinematics at every frame and scaled down to the cap. In a test on
+stack_blocks_two the new noisy rollouts stay within 4–7 cm of the expert at the expert's
+speed, and `grasp_miss` lands 65–95 % of the requested offset at the grasp (least for upward
+shifts).
+
+**Interaction focus (`cf_focus_prob`, default 0.7).** Uniformly drawn edit points mostly
+fall in free-space motion. With this probability a mode's edit point (breakpoint, flip step,
+noise points) is drawn within 20 frames before to 8 after an expert interaction: a gripper
+close / open, or a robot-object contact onset when contacts are recorded. This is the knob for
+how interaction-dense the counterfactual set is; `scripts/contact_stats.py` measures the
+result.
+
+**The world counts as divergence.** A counterfactual whose objects end ≥ 3 cm
+(`cf_min_object_deviation_m`) from where the expert's do has diverged even if the arm is
+within the TCP gate -- a 3 cm grasp miss that leaves the block on the table.
+
 Each counterfactual's `metadata.json` records mode, arms, breakpoint, the edit parameters,
 the measured divergence (overall and per arm), the attempt log, and whether the task still
 **succeeded** — a free label for outcome prediction.
 
 ---
+
+## 5b. Contacts
+
+`contacts.py` records state, not events (robocasa's `physical_state.py` philosophy): every
+physics step, SAPIEN's contact list reduced to PART pairs -- `left/right_finger` (gripper
+finger links), `left/right_gripper` (rest of the gripper), `left/right_arm`, `robot_base`,
+`obj:<name>`, `art:<name>` (articulated objects), `env:<name>` (table, wall, static targets).
+Contacts inside one arm's chain are dropped (joint-internal). Steps are binned into video
+frames exactly like poses, so `contacts.npz` row k is frame k. Repeated actor names (both
+blocks of stack_blocks_two are "box") become `box#0`, `box#1`.
+
+Events are derived, cheap to recompute: contact windows (bridging 1-frame gaps), held windows
+(the arm's fingers on an object that is off every static surface or lifted > 1 cm), and per
+rollout the share of frames with robot-object contact / an object held, event counts per
+kind, and the collisions the rollout caused (arm or base on an object, robot on the table, arm
+on arm, object-object pairs not touching at set-up). `contact_stats.py` turns them into the
+sampling index and the per-mode distribution numbers to track across generator iterations.
+
+Data generated before contacts existed is annotated by `annotate_contacts.py`: an unrendered
+replay of each rollout's saved stream from its seed. Physics is deterministic, so the replay
+is the filmed rollout -- checked per rollout against `object_poses.npz` (0 drift on the test
+episodes), and reported in `contacts.json["replay_check"]`.
 
 ## 6. Output and conventions
 
@@ -199,8 +246,9 @@ the measured divergence (overall and per arm), the attempt log, and whether the 
 * Rig-paired episodes (`PAIR_SIZE`) — needs a per-pair rig validated across seeds.
 * Per-video texture re-sampling (`--vary_textures`) — RoboTwin draws textures from the seed;
   across seeds the variety is already there.
-* The physical-event ground truth (`physical_state.npz`, seg videos, contacts) — only
-  per-frame object poses and articulated-object joint positions are recorded for now.
+* Segmentation (object-mask) videos and per-instance geometry from robocasa's physical-event
+  ground truth -- contacts, object poses and articulated-object joints are recorded; masks
+  need a render pass and are next.
 * Robocasa's shared-breakpoint `scripted_diverge` subcases (two futures from one prefix),
   its multi-DoF scripted motions, and its gripper flip on top of `noisy_replay` — here the
   flip is its own mode and scripted motions are single-DoF per arm.
