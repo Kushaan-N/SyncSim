@@ -19,7 +19,10 @@ syncsim/rt_env.py         RoboTwin bridge: task args, setup, ControlStream recor
 syncsim/cameras.py        3rd-person rig sampling + one-replay segmentation gate, wrist jitter
 syncsim/motion.py         straight-line EE displacements (mplib screw, else short curobo hops), re-timed
 syncsim/calibration.py    bimanual 6-DoF-per-arm sweep with exact per-leg frame spans
-syncsim/counterfactual.py noisy_replay / scripted_diverge / freeze_arm / gripper_flip, divergence + speed
+syncsim/counterfactual.py noisy_replay / scripted_diverge / freeze_arm / gripper_flip / grasp_miss,
+                          interaction focus, divergence (TCP, gripper, objects) + speed
+syncsim/taskspace.py      TCP offset -> joint offset (pinocchio FK in the ROOT frame -> world), bounded
+syncsim/contacts.py       per-frame part-pair contacts (ContactTracker) + derived windows / summary
 syncsim/recorder.py       cameras -> mp4s, pose.pkl / actions.npy / joints.npy / object_poses.npz
 syncsim/rollout.py        steps a stream (or live segments) and captures every frame_stride steps
 syncsim/generate.py       per-task driver + Config (every knob) -> `python -m syncsim.generate`;
@@ -32,6 +35,9 @@ scripts/watch_validate.sh validate each task as soon as it finishes (-> <data>/_
 scripts/dataset_stats.py  yield / camera / calibration / counterfactual stats for a data root
 scripts/redo_cf.sh        regenerate the counterfactuals in a verify_set exclude list
 scripts/quarantine.py     move what still fails out of the dataset tree (reversible)
+scripts/annotate_contacts.py  add contacts to existing rollouts by unrendered stream replay (+ drift check)
+scripts/submit_contacts.sh    SLURM array of annotate_contacts.py shards over a data root
+scripts/contact_stats.py      contact_index.jsonl / contact_events.jsonl + per-mode interaction numbers
 ```
 
 ## Environment (AICR cluster)
@@ -63,5 +69,9 @@ scripts/quarantine.py     move what still fails out of the dataset tree (reversi
 - Shader is a global SAPIEN setting read at camera creation: always create cameras through
   `cameras.add_camera(..., shader=...)`, which restores RoboTwin's `rt` afterwards.
 - Quaternions on disk are **xyzw** (robocasa convention); RoboTwin/SAPIEN are wxyz internally.
+- Contacts are physics, not rendering: record them through `Rollout(..., contacts=tracker)`
+  with the tracker built on the freshly reset task BEFORE the Rollout (it captures frame 0).
+- Task-space edits solve IK once per edit point and bound the trajectory-wide TCP effect;
+  don't go back to per-frame IK along a trajectory (IK-branch flips -> m/s spikes).
 - `actions.npy` is `[T, 16]` = per arm (TCP xyz, quat xyzw, gripper opening); layout is in
   `base_init.json["action_layout"]`. Change it only together with that layout.
