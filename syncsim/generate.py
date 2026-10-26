@@ -316,7 +316,8 @@ class Generator:
         if tr is None:
             return None
         return tr.save(out_dir, object_poses=np.asarray(rec.log["objects"]),
-                       object_names=[e.get_name() for e in rec.actors], extra={"source": "live"})
+                       object_names=[e.get_name() for e in rec.actors], extra={"source": "live"},
+                       gripper_open={a: np.asarray(rec.log[f"{a}_g"]) for a in ("left", "right")})
 
     def _set_expert(self, stream, obj_track, obj_names, contacts=None):
         from .contacts import ROBOT_OBJECT_KINDS
