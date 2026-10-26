@@ -9,8 +9,11 @@ Every physics step, SAPIEN's contact list is reduced to PART pairs. A part is
     left_arm / right_arm           every other link on that arm's chain
     robot_base                     robot links on neither arm chain (torso, mobile base)
     obj:<name>                     a free-moving scene actor (task objects + clutter)
+    fix:<name>                     a named static / kinematic task object (the bell, the stapler,
+                                   a target pad, a dustbin): an object the robot interacts with,
+                                   that just does not move freely
     art:<name>                     a link of a non-robot articulation (laptop lid, drawer, ...)
-    env:<name>                     static scenery (table, wall, ground)
+    env:<name>                     static scenery: table, wall, ground only
 
 Pairs inside one robot part group (finger-finger of the same gripper, links of one arm) are
 dropped: they are joint-internal, not interactions. Contacts are binned into video frames
@@ -43,7 +46,7 @@ import sapien
 
 ROBOT_PARTS = ("left_finger", "left_gripper", "left_arm", "right_finger", "right_gripper",
                "right_arm", "robot_base")
-STATIC_NAMES = ("table", "wall", "ground")
+STATIC_NAMES = ("table", "wall", "ground")      # scenery; any other unlabelled actor is fix:
 TOUCH_SEPARATION_M = 5e-4     # a contact point this close (or with impulse) counts as touching
 ROBOT_OBJECT_KINDS = ("gripper-obj", "arm-obj", "body-obj", "art-gripper", "arm-art", "art-body")
 
@@ -117,6 +120,14 @@ def _group(part):
     return part
 
 
+def relabel(part):
+    """v1 labels -> current: contacts recorded before fix: existed called every unlabelled
+    actor env:<name>; only table / wall / ground are scenery."""
+    if part.startswith("env:") and part[4:] not in STATIC_NAMES:
+        return "fix:" + part[4:]
+    return part
+
+
 def pair_kind(a, b):
     """Coarse category of a part pair, used for summaries and sampling."""
     def cls(p):
@@ -126,7 +137,8 @@ def pair_kind(a, b):
             return "arm"
         if p == "robot_base":
             return "body"
-        return p.split(":")[0]                  # obj / art / env
+        c = p.split(":")[0]                     # obj / fix / art / env
+        return "obj" if c == "fix" else c       # a fixed task object is still an object
     ca, cb = sorted((cls(a), cls(b)))
     if {ca, cb} <= {"gripper", "arm", "body"}:
         return "robot-robot"
@@ -163,9 +175,12 @@ class ContactTracker:
         lab = self.label.get(eid)
         if lab is None:
             name = body.entity.get_name() or f"id{eid}"
-            if name not in STATIC_NAMES:
+            if name in STATIC_NAMES:
+                lab = f"env:{name}"
+            else:
+                lab = f"fix:{name}"
                 self.unknown.add(name)
-            lab = self.label[eid] = f"env:{name}"
+            self.label[eid] = lab
         return lab
 
     def _read(self):
@@ -221,16 +236,18 @@ class ContactTracker:
                 "touch": touch, "impulse": impulse, "pos": pos,
                 "frame_time_s": np.float32(self.dt * self.stride)}
 
-    def save(self, out_dir, object_poses=None, object_names=None, extra=None):
-        """Write contacts.npz (dense) + contacts.json (events + summary)."""
+    def save(self, out_dir, object_poses=None, object_names=None, extra=None, name="contacts",
+             gripper_open=None):
+        """Write <name>.npz (dense) + <name>.json (events + summary). `gripper_open`
+        {arm: [T] commanded opening, 1 = open} lets held windows require a closed gripper."""
         A = self.arrays()
-        np.savez_compressed(os.path.join(out_dir, "contacts.npz"), **A)
-        ev = events(A, object_poses, object_names)
+        np.savez_compressed(os.path.join(out_dir, f"{name}.npz"), **A)
+        ev = events(A, object_poses, object_names, gripper_open=gripper_open)
         if extra:
             ev.update(extra)
         if self.unknown:
-            ev["unlabelled_bodies"] = sorted(self.unknown)
-        with open(os.path.join(out_dir, "contacts.json"), "w") as f:
+            ev["fixed_objects"] = sorted(self.unknown)
+        with open(os.path.join(out_dir, f"{name}.json"), "w") as f:
             json.dump(ev, f, indent=1)
         return ev
 
@@ -261,11 +278,16 @@ def _disp(track, a, b):
     return float(np.linalg.norm(track[b, :3] - track[a, :3]))
 
 
-def events(A, object_poses=None, object_names=None, after_frames=10, lift_m=0.01):
+def events(A, object_poses=None, object_names=None, after_frames=10, lift_m=0.01,
+           gripper_open=None):
     """Contact windows and per-rollout interaction summary. `object_poses` [T, O, 7] (xyz +
     quat) and `object_names` [O] (actor names, as in object_poses.npz, in recorder order) add
-    object motion; repeated names are disambiguated exactly as the tracker's labels are."""
-    pa, pb, kind = [list(map(str, A[k])) for k in ("pair_a", "pair_b", "pair_kind")]
+    object motion; repeated names are disambiguated exactly as the tracker's labels are.
+    `gripper_open` {arm: [T] commanded opening in [0, 1]}: held needs that gripper closed.
+    v1 part labels (env:<task object>) are mapped to fix: on the fly (`relabel`)."""
+    pa = [relabel(str(x)) for x in A["pair_a"]]
+    pb = [relabel(str(x)) for x in A["pair_b"]]
+    kind = [pair_kind(a, b) for a, b in zip(pa, pb)]
     touch, imp = np.asarray(A["touch"]), np.asarray(A["impulse"])
     T = touch.shape[0]
     ft = float(A["frame_time_s"])
@@ -278,15 +300,15 @@ def events(A, object_poses=None, object_names=None, after_frames=10, lift_m=0.01
 
     def obj_of(a, b):
         for p in (a, b):
-            if p.startswith(("obj:", "art:")):
+            if p.startswith(("obj:", "fix:", "art:")):
                 return p
         return None
 
     wins = []
     for j in range(len(pa)):
         for s, e in windows(on[:, j]):
-            if s == 0 and pa[j].startswith(("obj:", "art:", "env:")) and pb[j].startswith(
-                    ("obj:", "art:", "env:")):
+            scene = ("obj:", "fix:", "art:", "env:")
+            if s == 0 and pa[j].startswith(scene) and pb[j].startswith(scene):
                 started = "initial"             # resting contact present at set-up
             else:
                 started = "rollout"
@@ -295,8 +317,9 @@ def events(A, object_poses=None, object_names=None, after_frames=10, lift_m=0.01
                  "peak_force_n": float(imp[s:e + 1, j].max() / ft),
                  "mean_force_n": float(imp[s:e + 1, j].mean() / ft)}
             o = obj_of(pa[j], pb[j])
-            if o in obj_track:
+            if o is not None:
                 w["object"] = o
+            if o in obj_track:
                 w["obj_disp_during_m"] = _disp(obj_track[o], s, e)
                 w["obj_disp_after_m"] = _disp(obj_track[o], e, e + after_frames)
             wins.append(w)
@@ -309,15 +332,27 @@ def events(A, object_poses=None, object_names=None, after_frames=10, lift_m=0.01
         by_obj = {}
         for j in fing:
             by_obj.setdefault(obj_of(pa[j], pb[j]), []).append(j)
+        closed = None
+        if gripper_open is not None and arm in gripper_open:
+            g = np.asarray(gripper_open[arm], dtype=np.float64)[:T]
+            closed = np.zeros(T, bool)
+            closed[:len(g)] = g < 0.5
         for o, cols in by_obj.items():
-            # held = the arm's fingers touch the object while it is off every static
-            # surface or above where it started (a lifted / carried object)
+            if o.startswith("fix:"):
+                continue                        # a fixed object is pressed / touched, not held
+            # held = the arm's fingers touch the object, its gripper is commanded closed, and
+            # the object is off every static surface (scenery or a fixed object) or above where
+            # it started -- a lifted / carried object. Without the closed test an open finger
+            # resting on a stacked block read as "held" (43 of 729 sampled v1 windows).
             pinch = on[:, cols].any(axis=1)
+            if closed is not None:
+                pinch &= closed
             off = np.ones(T, bool)
             for j in range(len(pa)):
-                if o in (pa[j], pb[j]) and kind[j] in ("env-obj", "art-env"):
+                other = pb[j] if pa[j] == o else pa[j] if pb[j] == o else None
+                if other is not None and other.startswith(("env:", "fix:")):
                     off &= ~on[:, j]
-            lifted = np.ones(T, bool)
+            lifted = np.zeros(T, bool)
             if o in obj_track:
                 z = obj_track[o][:, 2]
                 lifted = z > z[0] + lift_m
