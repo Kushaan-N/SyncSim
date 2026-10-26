@@ -24,6 +24,10 @@ counterfact divergence recomputed from pose.pkl equals metadata (render == probe
                           (being shoved by the other arm is reported, not failed)
               gripper_flip: identical before the flip, flipped gripper differs after it
               noisy_replay: identical to the expert before the first perturbation ramp
+                            (v1 joint-space points log steps, task-space ones frames)
+              grasp_miss: identical before the approach ramp; the shifted arm really is
+                          off the expert at the grasp (>= GRASP_MISS_MIN_FRAC of the offset);
+                          the other arm is untouched
               scripted_diverge: every arm the mode chose got a scripted motion
 motion      no end effector moves implausibly fast: a counterfactual's peak TCP speed must
             stay <= max(MAX_TCP_SPEED, EXPERT_SPEED_MARGIN x the expert's peak); calibration
@@ -32,6 +36,10 @@ dark scan   (--dark_scan) every --dark_stride-th frame of every WRIST video is d
             video with more than DARK_FRAC_MAX of its frames darker than DARK_MEAN fails
             (a lens that slips into the wrist housing only shows mid-episode)
 objects     object_poses.npz covers every frame; articulated objects have joint tracks
+contacts    contacts.npz / contacts.json cover every frame of the rollout (missing = WARN:
+            data from before contact recording; scripts/annotate_contacts.py adds them); an
+            offline-annotated rollout's replay matched the stored poses (<= REPLAY_DRIFT_M);
+            held windows only while that gripper is commanded closed
 
 --exclude_out writes one line per rollout / unit with an ERROR (path TAB first reason),
 the input for `generate.py --redo_list` (counterfactual dirs) or a training exclude list.
@@ -67,6 +75,8 @@ MAX_TCP_SPEED = 1.0          # m/s; the expert's p99 peak is ~0.6 m/s
 EXPERT_SPEED_MARGIN = 1.5
 DARK_MEAN = 20.0             # 0-255 frame mean counted as "dark"
 DARK_FRAC_MAX = 0.05
+GRASP_MISS_MIN_FRAC = 0.4    # the shifted TCP must realise >= 40 % of the offset at the grasp
+REPLAY_DRIFT_M = 0.005       # offline contact replay vs stored object / TCP poses
 
 
 class Report:
@@ -148,6 +158,29 @@ def video_info(path, sample=(0, 0.5, -1)):
 
 
 # ---- checks ------------------------------------------------------------------------------
+def check_contacts(d, pose, T, rep):
+    cj, cn = os.path.join(d, "contacts.json"), os.path.join(d, "contacts.npz")
+    if not (os.path.exists(cj) and os.path.exists(cn)):
+        rep.warn(d, "no contacts (generated before contact recording; annotate_contacts.py)")
+        return
+    z = np.load(cn)
+    if z["touch"].shape[0] != T:
+        rep.err(d, f"contacts length: {z['touch'].shape[0]} != {T}")
+    c = json.load(open(cj))
+    if c.get("summary", {}).get("frames") != T:
+        rep.err(d, f"contacts.json frames: {c.get('summary', {}).get('frames')} != {T}")
+    rc = c.get("replay_check", {})
+    drift = max(rc.get("max_drift_m", 0.0), rc.get("max_tcp_drift_m", 0.0))
+    if drift > REPLAY_DRIFT_M:
+        rep.err(d, f"contact replay drifted from the stored rollout: {drift:.4f} m")
+    for arm, ws in c.get("held", {}).items():
+        g = np.asarray(pose[f"{arm}_gripper_open"])
+        for w in ws:
+            if (g[w["start"]:w["end"] + 1] >= 0.5).any():
+                rep.err(d, f"held window with an open gripper: {arm} {w['start']}-{w['end']}")
+                break
+
+
 def check_rollout(d, rep, check_videos=True):
     req = ["pose.pkl", "actions.npy", "joints.npy", "object_poses.npz", "metadata.json"]
     if os.path.basename(d) == "calibration":
@@ -179,6 +212,7 @@ def check_rollout(d, rep, check_videos=True):
         for i in range(len(ob["art_names"])):
             if ob[f"art{i}_qpos"].shape[0] != T:
                 rep.err(d, f"articulation track length: art{i} {ob[f'art{i}_qpos'].shape[0]} != {T}")
+    check_contacts(d, pose, T, rep)
     vids = sorted(glob.glob(os.path.join(d, "*_rgb*", "video.mp4")))
     if len(vids) < 3:
         rep.err(d, f"videos: only {len(vids)} video(s)")
@@ -284,6 +318,17 @@ def check_calibration(cal, pose, rep):
     return mr
 
 
+def arm_touched(rollout_dir, arm, f0, f1):
+    """Does any part of `arm` touch anything in frames [f0, f1] (contacts.npz)?"""
+    p = os.path.join(rollout_dir, "contacts.npz")
+    if not os.path.exists(p):
+        return False
+    z = np.load(p)
+    cols = [j for j, (a, b) in enumerate(zip(map(str, z["pair_a"]), map(str, z["pair_b"])))
+            if a.startswith(arm + "_") or b.startswith(arm + "_")]
+    return bool(cols) and bool((z["touch"][max(0, f0):f1 + 1][:, cols] > 0).any())
+
+
 def check_counterfactual(cf, pose, exp_pose, rep):
     md = json.load(open(os.path.join(cf, "metadata.json")))
     mode = md["counterfactual_mode"]
@@ -336,8 +381,35 @@ def check_counterfactual(cf, pose, exp_pose, rep):
         m = min(len(ge), len(gc))
         if fr < m and np.all(np.abs(np.round(ge[fr:m]) - np.round(gc[fr:m])) < 0.5):
             rep.err(cf, f"gripper flip has no effect on {arm} gripper command")
+    if mode == "grasp_miss":
+        gm = md["grasp_miss"]
+        arm = gm["arm"]
+        ai = 0 if arm == "left" else 1
+        first = gm["close_frame"] - gm["ramp_frames"] - 1
+        pre = d[:max(0, first)]
+        if len(pre) and pre.max() > PREFIX_TOL_M:
+            rep.err(cf, f"grasp_miss differs before its approach ramp: {pre.max():.4f} m")
+        other = d[:, 1 - ai]
+        if other.max() > PREFIX_TOL_M and first > 0:
+            # the other arm runs the expert's commands; it may only differ once the shifted
+            # arm has changed the world (a handover, a shared object), never before the ramp
+            if other[:max(0, first)].max() > PREFIX_TOL_M:
+                rep.err(cf, f"grasp_miss moved the other arm before the ramp")
+        cfr = min(gm["close_frame"], n - 1)
+        got = float(d[cfr, ai])
+        # the offset the edit actually commanded: after its trajectory-wide bound (`scale`);
+        # first-version metadata logged the request before scaling
+        want = gm["magnitude_m"] if "requested_m" in gm else gm["magnitude_m"] * gm.get("scale", 1.0)
+        if got < GRASP_MISS_MIN_FRAC * want:
+            msg = f"grasp_miss offset not realised at the grasp: {got:.3f} m of {want:.3f} m"
+            if arm_touched(cf, arm, gm["close_frame"] - gm["ramp_frames"], gm["close_frame"]):
+                rep.warn(cf, msg + " (blocked by contact: the shifted hand touches the scene)")
+            else:
+                rep.err(cf, msg)
     if mode == "noisy_replay":
-        steps = [s for a in md["noise"]["points"].values() for s in a["steps"]]
+        stride = exp_pose["save_stride"]
+        steps = [s for a in md["noise"]["points"].values()
+                 for s in a.get("steps", [f * stride for f in a.get("frames", [])])]
         ramp = md["noise"]["interval_frames"]
         if steps:
             first = int(min(steps) // exp_pose["save_stride"]) - ramp - 1
