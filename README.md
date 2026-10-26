@@ -151,7 +151,8 @@ each rollout directory:
     actions.npy    [T,16]: per arm gripper-centre xyz, quat xyzw, opening (left 0:8, right 8:16)
     joints.npy     measured joint positions of both arms
     object_poses.npz   world pose of every movable object per frame
-    contacts.npz   per frame x part pair: touching share of the frame, impulse, contact point
+    contacts.npz   per frame x part pair (gripper fingers / body, arm, base, objects, fixed
+                   task objects, table): touching share of the frame, impulse, contact point
     contacts.json  contact windows (frame x to y, force, object motion during / after),
                    held windows per arm, and a summary (interaction share, event counts)
 ```
