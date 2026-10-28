@@ -20,7 +20,7 @@ REPO="$(cd "${SCRIPT_DIR}/.." && pwd)"
 # ---- run control ------------------------------------------------------------
 : "${SET_ID:?set SET_ID (seed shard index)}"
 : "${OUTPUT_BASE:=/scratch/yuncongyang_umass/syncsim/data}"
-: "${PYTHON_BIN:=/scratch/yuncongyang_umass/syncsim/envs/rt/bin/python}"
+: "${PYTHON_BIN:=/work/umass/chuangg_umass/yuncongyang_umass/syncsim/envs/rt/bin/python}"
 : "${ROBOTWIN_ROOT:=/home/yuncongyang_umass/kn/RoboTwin}"
 : "${TASKS:=ALL}"                    # ALL = every task module in RoboTwin/envs
 : "${GPUS:=0}"                       # comma list; tasks round-robin over them
