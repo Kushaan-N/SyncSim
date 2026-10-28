@@ -14,10 +14,15 @@ in its CONTROLS only. Modes (one per counterfactual index, drawn with `cf_mode_p
                    integrating OSC deltas. (Gripper flips are their own mode, below.)
   grasp_miss       one of the expert's grasps (a gripper-close command) is approached with the
                    TCP shifted `grasp_miss_m` sideways (or, with `grasp_miss_vertical_prob`,
-                   upward), ramped in over the approach and kept: the fingers close beside or
-                   above the object, or catch it off-centre -- a missed or bad grasp, the most
-                   common real manipulation failure, made by a small offset rather than by
-                   moving the arm somewhere unrelated.
+                   upward): ramped in over the approach, held through the close and
+                   `grasp_miss_hold_frames` after it, then ramped out over
+                   `grasp_miss_release_frames`, so the (now empty-handed) arm eases back onto
+                   the expert's path. The fingers close beside or above the object, or catch it
+                   off-centre -- a missed or bad grasp, the most common real manipulation
+                   failure, made by a small offset rather than by moving the arm somewhere
+                   unrelated. Keeping the offset to the end (first version) let the bound on
+                   its trajectory-wide effect shrink it to ~30 % AT the grasp on tasks that
+                   lift high afterwards (lift_pot).
   scripted_diverge expert prefix to a breakpoint, then 1-2 scripted end-effector motions
                    planned LIVE from the breakpoint state for the chosen arm(s); the other
                    arm (if not chosen) and both grippers HOLD their breakpoint command
@@ -231,12 +236,19 @@ def grasp_miss(stream, rng, cfg, arm, escalation, frame_stride, dt, robot):
     kin = ArmKinematics(robot, arm)
     dq, done, resid = solve_offset(kin, np.asarray(stream[f"{arm}_q"])[c], mag * direction)
     a0 = c - cfg.grasp_miss_approach_frames * frame_stride
-    w = smooth_ramp(stream.n, a0, c - 2 * frame_stride)
+    r0 = c + cfg.grasp_miss_hold_frames * frame_stride
+    w = smooth_ramp(stream.n, a0, c - 2 * frame_stride) * (
+        1.0 - smooth_ramp(stream.n, r0, r0 + cfg.grasp_miss_release_frames * frame_stride))
     ramps, eff, scale = bound_ramps(kin, np.asarray(stream[f"{arm}_q"], dtype=np.float64),
                                     [(dq, w)], 1.5 * float(np.linalg.norm(done)), frame_stride)
     s = apply_joint_ramps(stream, arm, ramps, dt)
-    return s, {"kinematic_effect_m": eff, "scale": scale,"arm": arm, "close_step": c, "close_frame": int(c // frame_stride),
-               "offset_m": done.tolist(), "magnitude_m": float(np.linalg.norm(done)),
+    done = done * scale
+    return s, {"kinematic_effect_m": eff, "scale": scale, "arm": arm, "close_step": c,
+               "close_frame": int(c // frame_stride),
+               "requested_m": float(mag), "offset_m": done.tolist(),
+               "magnitude_m": float(np.linalg.norm(done)),
+               "hold_frames": cfg.grasp_miss_hold_frames,
+               "release_frames": cfg.grasp_miss_release_frames,
                "vertical": bool(direction[2] > 0), "ramp_frames": cfg.grasp_miss_approach_frames,
                "joint_offset_rad": np.asarray(dq).round(4).tolist(),
                "ik_residual_m": float(resid)}
@@ -307,6 +319,7 @@ def scripted_suffix(rollout, rng, cfg, arms, escalation):
                     plans[arm] = (path, n)
                     log.append({"segment": si, "arm": arm, "dof": str(dof),
                                 "amount": float(sign * mag * shrink), "planner": method,
+                                "planner_used": plan_to.last,
                                 "joint_travel_rad": float(travel), "steps": int(n)})
                     break
                 if arm in plans:
