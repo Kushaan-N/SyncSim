@@ -94,6 +94,7 @@ def record_calibration(rollout, rng, cfg):
                 path = plan_to(robot, arm, displaced_pose(start7, dof, amount))
                 if path is None:
                     continue
+                leg["planner"] = plan_to.last
                 n = max(10, int(np.ceil(abs(amount) / speed / dt)))
                 q, dq = retime(path, n, dt)
                 leg["sign"] = "+" if sg > 0 else "-"
