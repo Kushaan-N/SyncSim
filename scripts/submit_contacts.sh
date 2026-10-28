@@ -13,7 +13,7 @@ REPO="$(cd "${SCRIPT_DIR}/.." && pwd)"
 : "${PARTITION:=rtx-batch,rtx-devel}"
 : "${ACCOUNT:=chuangg_umass}"
 : "${TIME:=4:00:00}"            # rtx-devel caps jobs at 4 h
-: "${PYTHON_BIN:=/scratch/yuncongyang_umass/syncsim/envs/rt/bin/python}"
+: "${PYTHON_BIN:=/work/umass/chuangg_umass/yuncongyang_umass/syncsim/envs/rt/bin/python}"
 : "${ROBOTWIN_ROOT:=/home/yuncongyang_umass/kn/RoboTwin}"
 LOG_DIR="${DATA_ROOT}/_contacts_logs"
 mkdir -p "${LOG_DIR}"
