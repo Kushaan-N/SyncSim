@@ -131,6 +131,8 @@ class Config:
     grasp_miss_m: tuple = (0.025, 0.06)      # approach shifted this far from the expert's grasp
     grasp_miss_vertical_prob: float = 0.25   # ... upward (closing above the object) vs sideways
     grasp_miss_approach_frames: int = 15     # offset ramps in over the last frames before the close
+    grasp_miss_hold_frames: int = 15         # ... is held this long after the close ...
+    grasp_miss_release_frames: int = 20      # ... then ramps out: the empty arm rejoins the expert
     flip_lo_frac: float = 0.25
     flip_hi_frac: float = 0.85
     diverge_two_segment_prob: float = 0.5
