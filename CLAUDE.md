@@ -23,6 +23,7 @@ syncsim/counterfactual.py noisy_replay / scripted_diverge / freeze_arm / gripper
                           interaction focus, divergence (TCP, gripper, objects) + speed
 syncsim/taskspace.py      TCP offset -> joint offset (pinocchio FK in the ROOT frame -> world), bounded
 syncsim/contacts.py       per-frame part-pair contacts (ContactTracker) + derived windows / summary
+syncsim/masks.py          per-frame part-id mask videos for every camera (MaskRig), lossless FFV1
 syncsim/recorder.py       cameras -> mp4s, pose.pkl / actions.npy / joints.npy / object_poses.npz
 syncsim/rollout.py        steps a stream (or live segments) and captures every frame_stride steps
 syncsim/generate.py       per-task driver + Config (every knob) -> `python -m syncsim.generate`;
@@ -38,6 +39,8 @@ scripts/quarantine.py     move what still fails out of the dataset tree (reversi
 scripts/annotate_contacts.py  add contacts to existing rollouts by unrendered stream replay (+ drift check)
 scripts/submit_contacts.sh    SLURM array of annotate_contacts.py shards over a data root
 scripts/contact_stats.py      contact_index.jsonl / contact_events.jsonl + per-mode interaction numbers
+scripts/annotate_masks.py     add masks to existing rollouts by replay + segmentation render
+scripts/submit_masks.sh       SLURM array of annotate_masks.py shards over a data root
 ```
 
 ## Environment (AICR cluster)
@@ -75,6 +78,8 @@ scripts/contact_stats.py      contact_index.jsonl / contact_events.jsonl + per-m
 - Quaternions on disk are **xyzw** (robocasa convention); RoboTwin/SAPIEN are wxyz internally.
 - Contacts are physics, not rendering: record them through `Rollout(..., contacts=tracker)`
   with the tracker built on the freshly reset task BEFORE the Rollout (it captures frame 0).
+- Mask cameras need a near plane of a few mm (`masks.MASK_NEAR_M`): the rasteriser clips
+  what the ray tracer does not, and wrist cameras see held objects from a few cm.
 - Task-space edits solve IK once per edit point and bound the trajectory-wide TCP effect;
   don't go back to per-frame IK along a trajectory (IK-branch flips -> m/s spikes).
 - `actions.npy` is `[T, 16]` = per arm (TCP xyz, quat xyzw, gripper opening); layout is in
