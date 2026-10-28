@@ -357,9 +357,12 @@ def events(A, object_poses=None, object_names=None, after_frames=10, lift_m=0.01
                 z = obj_track[o][:, 2]
                 lifted = z > z[0] + lift_m
             h = pinch & (off | lifted)
-            for s, e in windows(h, max_gap=2, min_len=3):
-                held.setdefault(arm, []).append({"object": o, "start": s, "end": e,
-                                                 "frames": e - s + 1})
+            for s0, e0 in windows(h, max_gap=2, min_len=3):
+                # a bridged gap may not span an OPEN gripper (a flip that opens it for 2 frames)
+                ok = closed[s0:e0 + 1] if closed is not None else np.ones(e0 - s0 + 1, bool)
+                for s, e in windows(ok, max_gap=0, min_len=3):
+                    held.setdefault(arm, []).append({"object": o, "start": s0 + s, "end": s0 + e,
+                                                     "frames": e - s + 1})
 
     # ---- summary ----------------------------------------------------------------------
     def frac(mask):
