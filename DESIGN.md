@@ -108,7 +108,10 @@ Robocasa commanded per-step OSC deltas, so magnitude = speed. RoboTwin is joint-
 controlled, so each leg is **planned as a straight line** from the current state — mplib's
 screw planner, else a chain of short curobo hops that cannot change IK branch
 (`motion.plan_to`) — and **re-timed to a constant speed** (`motion.retime`); magnitude
-(distance) and speed are independent knobs. Translations are 5–8 cm at 8 cm/s, rotations
+(distance) and speed are independent knobs. (The v1 dataset was in fact planned entirely by
+the hop chain: commit 65f78c4 deleted `_screw_planner` and `plan_to`'s bare `except` swallowed
+the NameError; restored, `plan_to.last` now records which planner ran, and code errors are
+re-raised instead of read as "unplannable".) Translations are 5–8 cm at 8 cm/s, rotations
 12–20° at 20°/s, so both last ~12–21 frames (at the earlier 40°/s a rotation leg lasted
 only ~10, too few once a clip is temporally subsampled).
 Unreachable legs retry at 60 % and 35 % of the magnitude, else are recorded as skipped.
@@ -135,7 +138,7 @@ can cut out each leg directly instead of rediscovering it from pose deltas.
 | mode | what | robocasa analogue |
 |---|---|---|
 | `noisy_replay` | expert stream + smooth sparse **end-effector** offsets (`noise_tcp_sigma_m` per point, accumulated offset capped at `noise_max_offset_m`) on left / right / both arms; offsets **persist** after their ramp (`noise_persist`). `noise_space=joint` is the v1 joint-space version | `noisy_replay` (OSC deltas integrate, so robocasa offsets persisted too) |
-| `grasp_miss` | one of the arm's grasps (a gripper-close command) approached with the TCP shifted 2.5–6 cm sideways or upward, ramped in over the last 15 frames and kept | new — the commonest real manipulation failure, made by a small offset |
+| `grasp_miss` | one of the arm's grasps (a gripper-close command) approached with the TCP shifted 2.5–6 cm sideways or upward: ramped in over the last 15 frames before the close, held 15 frames after it, then ramped out over 20 so the empty-handed arm rejoins the expert's path | new — the commonest real manipulation failure, made by a small offset |
 | `scripted_diverge` | expert prefix → 1–2 scripted EE motions planned live for the chosen arm(s); unchosen arm + grippers **hold** | `scripted_diverge` with the opt-in `hold` gripper mode |
 | `freeze_arm` | from a breakpoint one arm holds while the other keeps executing the expert | new — bimanual only: breaks coordination (handover never happens) with natural motion |
 | `gripper_flip` | one arm's gripper command inverted from a sampled step to the end | `--cf_gripper_flip_prob` |
@@ -176,10 +179,13 @@ gripper orientation, turned into a joint offset by IK at that frame (`taskspace.
 total is capped. One IK solve per point, not one per frame: re-solving along the trajectory
 flipped IK branches near wrist singularities (0.5–0.9 rad jumps, 1–7 m/s TCP spikes). A
 constant joint offset can still move the TCP further at another pose, so its effect is
-checked by forward kinematics at every frame and scaled down to the cap. In a test on
-stack_blocks_two the new noisy rollouts stay within 4–7 cm of the expert at the expert's
-speed, and `grasp_miss` lands 65–95 % of the requested offset at the grasp (least for upward
-shifts).
+checked by forward kinematics at every frame and scaled down to the cap (`scale` in the
+metadata). In a test on stack_blocks_two the new noisy rollouts stay within 4–7 cm of the
+expert at the expert's speed, and `grasp_miss` lands 65–95 % of the requested offset at the
+grasp (least for upward shifts). The first `grasp_miss` kept its offset to the end; on tasks
+that lift high afterwards (lift_pot) the same bound then cut it to ~30 % at the grasp itself,
+hence the hold-and-release window. `magnitude_m` is the offset after that scaling,
+`requested_m` the draw.
 
 **Interaction focus (`cf_focus_prob`, default 0.7).** Uniformly drawn edit points mostly
 fall in free-space motion. With this probability a mode's edit point (breakpoint, flip step,
@@ -203,13 +209,19 @@ the measured divergence (overall and per arm), the attempt log, and whether the 
 `contacts.py` records state, not events (robocasa's `physical_state.py` philosophy): every
 physics step, SAPIEN's contact list reduced to PART pairs -- `left/right_finger` (gripper
 finger links), `left/right_gripper` (rest of the gripper), `left/right_arm`, `robot_base`,
-`obj:<name>`, `art:<name>` (articulated objects), `env:<name>` (table, wall, static targets).
+`obj:<name>` (free-moving), `fix:<name>` (named static / kinematic task objects: the bell, the
+stapler, a target pad, a dustbin), `art:<name>` (articulated objects), `env:<name>` (table,
+wall, ground only). A fixed task object counts as an object for every interaction number:
+before `fix:` existed, pressing the bell read as robot-environment contact.
 Contacts inside one arm's chain are dropped (joint-internal). Steps are binned into video
 frames exactly like poses, so `contacts.npz` row k is frame k. Repeated actor names (both
 blocks of stack_blocks_two are "box") become `box#0`, `box#1`.
 
-Events are derived, cheap to recompute: contact windows (bridging 1-frame gaps), held windows
-(the arm's fingers on an object that is off every static surface or lifted > 1 cm), and per
+Events are derived, cheap to recompute (`annotate_contacts.py --rederive`, CPU only):
+contact windows (bridging 1-frame gaps), held windows (the arm's fingers on an object while
+that gripper is commanded CLOSED and the object is off every static surface -- scenery or a
+fixed object -- or lifted > 1 cm; without the closed test an open finger resting on a stacked
+block read as held in 6 % of sampled v1 windows), and per
 rollout the share of frames with robot-object contact / an object held, event counts per
 kind, and the collisions the rollout caused (arm or base on an object, robot on the table, arm
 on arm, object-object pairs not touching at set-up). `contact_stats.py` turns them into the
@@ -217,8 +229,17 @@ sampling index and the per-mode distribution numbers to track across generator i
 
 Data generated before contacts existed is annotated by `annotate_contacts.py`: an unrendered
 replay of each rollout's saved stream from its seed. Physics is deterministic, so the replay
-is the filmed rollout -- checked per rollout against `object_poses.npz` (0 drift on the test
-episodes), and reported in `contacts.json["replay_check"]`.
+is the filmed rollout -- checked per rollout against `object_poses.npz` and the TCPs in
+`pose.pkl`, and reported in `contacts.json["replay_check"]`. SAPIEN poses are float32, so an
+exact replay shows exactly 0: all 10,589 v1 rollouts did (84 of them, in scenes with no
+free-moving object, are checked through the TCPs only). Offline annotation of the 366 pilot
+rollouts that recorded contacts live reproduced them bit for bit (touch, impulse and contact
+point), so offline and live contacts are interchangeable.
+
+Note that re-generating a seed does NOT reproduce its expert: RoboTwin's GPU motion planner
+is not deterministic, so two generation runs of the same seed share the scene but not the
+expert motion. Comparisons between generator versions are statistical (same tasks and
+seeds), not paired rollout by rollout.
 
 ## 6. Output and conventions
 
