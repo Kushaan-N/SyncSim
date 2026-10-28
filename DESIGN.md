@@ -241,6 +241,21 @@ is not deterministic, so two generation runs of the same seed share the scene bu
 expert motion. Comparisons between generator versions are statistical (same tasks and
 seeds), not paired rollout by rollout.
 
+## 5c. Object masks
+
+`masks.py` writes, beside every RGB video, a label video whose pixels are part ids with the
+contacts' part names (0 = nothing drawn: outside the room). They come from SAPIEN's rasterised
+segmentation (the entity each pixel shows) through cameras with the recorded pose, field of
+view and size; wrist cameras are re-posed from their link every frame as the recorder does.
+Encoded as lossless FFV1 gray8 (bit-exact round trip).
+
+Checked against the filmed RGB on a handover episode: of the frames' strongly red pixels,
+98-100 % are labelled as the red box in both wrist views and camera B, and under 0.4 % as the
+table (camera A also sees a red stapler, which is labelled as the stapler). The first version clipped at the default 5 cm near plane: the rasteriser
+drops geometry nearer than that, the ray tracer that films the RGB does not, so the bottom of
+a block held in front of a wrist camera was missing and the table showed through it in the
+mask. Mask cameras now use a 2 mm near plane.
+
 ## 6. Output and conventions
 
 * Layout `set_<id>/<task>/episode_<seed>/camera_poses_<m>/...` mirrors robocasa, with
@@ -267,9 +282,8 @@ seeds), not paired rollout by rollout.
 * Rig-paired episodes (`PAIR_SIZE`) — needs a per-pair rig validated across seeds.
 * Per-video texture re-sampling (`--vary_textures`) — RoboTwin draws textures from the seed;
   across seeds the variety is already there.
-* Segmentation (object-mask) videos and per-instance geometry from robocasa's physical-event
-  ground truth -- contacts, object poses and articulated-object joints are recorded; masks
-  need a render pass and are next.
+* Per-instance geometry and depth from robocasa's physical-event ground truth -- contacts,
+  object masks, object poses and articulated-object joints are recorded.
 * Robocasa's shared-breakpoint `scripted_diverge` subcases (two futures from one prefix),
   its multi-DoF scripted motions, and its gripper flip on top of `noisy_replay` — here the
   flip is its own mode and scripted motions are single-DoF per arm.
