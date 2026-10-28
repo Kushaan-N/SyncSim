@@ -21,7 +21,7 @@ from .rt_env import ControlStream, apply_step
 class Rollout:
 
     def __init__(self, task, recorder, frame_stride, render=True, poll_success=False,
-                 contacts=None):
+                 contacts=None, masks=None):
         self.task = task
         self.rec = recorder
         self.stride = int(frame_stride)
@@ -32,8 +32,11 @@ class Rollout:
         self.poll_success = poll_success
         self.success_frames = []
         self.contacts = contacts
+        self.masks = masks                   # masks.MaskRig: a segmentation frame per video frame
         if recorder is not None:
             recorder.capture(0, render=render)
+        if masks is not None:
+            masks.capture()
 
     @property
     def frame(self):
@@ -57,6 +60,8 @@ class Rollout:
                     self.contacts.end_frame()
                 if self.rec is not None:
                     self.rec.capture(self.n, render=self.render)
+                if self.masks is not None:
+                    self.masks.capture()
                 if self.poll_success:
                     self._poll()
         self.parts.append(seg)
