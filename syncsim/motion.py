@@ -62,6 +62,24 @@ def displaced_pose(pose7, dof, amount):
     return out
 
 
+def _screw_planner(robot, arm):
+    """A scene-independent mplib planner for `arm`, built once per Robot from its URDF.
+    (RoboTwin's own `*_mplib_planner` is bound to the scene that existed at first load.)
+
+    Restored: commit 65f78c4 deleted this by accident, `plan_to` called it inside a bare
+    `except Exception`, so the NameError was swallowed and every "screw" plan silently fell
+    back to `plan_cartesian_chain` -- all of the v1 dataset was planned that way (still
+    straight lines, but its metadata says "screw")."""
+    cache = robot.__dict__.setdefault("_syncsim_screw", {})
+    if arm not in cache:
+        from envs.robot.planner import MplibPlanner
+        cache[arm] = MplibPlanner(
+            getattr(robot, f"{arm}_urdf_path"), getattr(robot, f"{arm}_srdf_path"),
+            getattr(robot, f"{arm}_move_group"), getattr(robot, f"{arm}_entity_origion_pose"),
+            getattr(robot, f"{arm}_entity"), "mplib_screw", scene=None)
+    return cache[arm]
+
+
 def _slerp(q0, q1, t):
     q0, q1 = np.asarray(q0, float), np.asarray(q1, float)
     d = float(np.dot(q0, q1))
@@ -108,36 +126,55 @@ def plan_cartesian_chain(robot, arm, target7, step_m=0.006, step_rad=0.03, max_j
     return np.asarray(path)
 
 
+# Errors that mean the CODE is wrong, never "this motion cannot be planned": re-raised, so a
+# broken planner call fails loudly instead of silently falling back (see _screw_planner).
+_BUG_ERRORS = (NameError, ImportError)
+
+
 def plan_to(robot, arm, target7, method="screw"):
     """Joint path [n, dof] moving `arm`'s end effector (RoboTwin ee-pose convention, xyz +
-    wxyz) in a straight line to target7, or None.
+    wxyz) in a straight line to target7, or None. `plan_to.last` records the planner that
+    produced the path ("screw" | "chain" | "curobo" | None), for the caller's metadata.
 
     method: screw (screw plan, else a chain of short curobo hops -- both straight lines) | curobo (RoboTwin's
     collision-aware joint-space planner) | screw_then_curobo (straight line if possible)."""
+    plan_to.last = None
     if method in ("screw", "screw_then_curobo"):
         try:
             pose = robot._trans_from_gripper_to_endlink(list(map(float, target7)), arm_tag=arm)
             qpos = getattr(robot, f"{arm}_entity").get_qpos()
             res = _screw_planner(robot, arm).plan_screw(qpos, pose)
             if isinstance(res, dict) and res.get("status") == "Success" and len(res["position"]):
+                plan_to.last = "screw"
                 return np.asarray(res["position"], dtype=np.float64)
+        except _BUG_ERRORS:
+            raise
         except Exception:
             pass
         try:
             path = plan_cartesian_chain(robot, arm, target7)
             if path is not None:
+                plan_to.last = "chain"
                 return path
+        except _BUG_ERRORS:
+            raise
         except Exception:
             pass
         if method == "screw":
             return None
     try:
         res = getattr(robot, f"{arm}_plan_path")(list(map(float, target7)))
+    except _BUG_ERRORS:
+        raise
     except Exception:
         return None
     if not isinstance(res, dict) or res.get("status") != "Success":
         return None
+    plan_to.last = "curobo"
     return np.asarray(res["position"], dtype=np.float64)
+
+
+plan_to.last = None
 
 
 def retime(path, n_steps, dt):
