@@ -42,7 +42,11 @@ scripts/contact_stats.py      contact_index.jsonl / contact_events.jsonl + per-m
 
 ## Environment (AICR cluster)
 
-- Conda env: `/scratch/yuncongyang_umass/syncsim/envs/rt` (python 3.10). RoboTwin checkout:
+- Conda env: `/work/umass/chuangg_umass/yuncongyang_umass/syncsim/envs/rt` (python 3.10; a
+  `conda create --clone` of the old /scratch env, moved 2026-10-25: /scratch's 30-day purge
+  goes by file mtime and conda keeps package build mtimes, so it kept deleting env files --
+  libstdc++, libexpat, ... -- and `import sapien` broke). Never put the env back on /scratch.
+  RoboTwin checkout:
   `/home/yuncongyang_umass/kn/RoboTwin` (`ROBOTWIN_ROOT`), assets downloaded there.
 - GPUs are Blackwell (RTX PRO 6000 sm_120, B200 sm_100): torch is **2.7.1+cu128**, not
   RoboTwin's pinned 2.4.1; curobo v0.7.8 is compiled with `TORCH_CUDA_ARCH_LIST="10.0;12.0"`
