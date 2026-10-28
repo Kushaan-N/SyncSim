@@ -58,6 +58,7 @@ class Config:
     video_crf: int = 18
     record_wrist: bool = True
     record_contacts: bool = True             # contacts.npz + contacts.json per rollout (syncsim/contacts.py)
+    record_masks: bool = True                # <view>/mask.mkv + masks.json per rollout (syncsim/masks.py)
     # ---- RoboTwin domain randomisation overrides (None = keep the task config's) -------
     random_background: str = ""              # "", "true", "false"
     cluttered_table: str = ""
@@ -227,7 +228,7 @@ def _freeze_breakpoint(rng, cfg, expert_tcp, arm_pref, focus=()):
 _REDO_SCENE_KEYS = ("task", "task_config", "embodiment", "random_background", "cluttered_table",
                     "random_light", "random_table_height")
 _REDO_NEW_PREFIXES = ("cf_", "noise_", "flip_", "diverge_", "freeze_", "grasp_miss_",
-                      "num_counterfactuals", "record_contacts",
+                      "num_counterfactuals", "record_contacts", "record_masks",
                       "redo_", "output_dir", "overwrite", "seed_start", "num_seeds",
                       "max_episodes")
 
@@ -313,6 +314,19 @@ class Generator:
             return None
         from .contacts import ContactTracker
         return ContactTracker(self.task, self.cfg.frame_stride)
+
+    def _masks(self, rig):
+        """A MaskRig mirroring the recorder's cameras (create it before the Rollout)."""
+        if not self.cfg.record_masks:
+            return None
+        from .masks import MaskRig
+        r = _rig_for_recorder(rig, self.cfg)
+        return MaskRig(self.task, r, self.cfg.image_size, self.cfg.image_size,
+                       record_wrist=self.cfg.record_wrist)
+
+    def _save_masks(self, mr, out_dir):
+        if mr is not None:
+            mr.save(out_dir, self.fps, extra={"source": "live"})
 
     def _save_contacts(self, tr, rec, out_dir):
         if tr is None:
@@ -510,7 +524,8 @@ class Generator:
         reset()
         rec = self._recorder(rig)
         tr = self._tracker()
-        ro = Rollout(self.task, rec, cfg.frame_stride, poll_success=True, contacts=tr)
+        mr = self._masks(rig)
+        ro = Rollout(self.task, rec, cfg.frame_stride, poll_success=True, contacts=tr, masks=mr)
         ro.run(stream)
         succ = ro.success()
         expert_success = succ["final"]
@@ -520,6 +535,7 @@ class Generator:
             return False, "expert_replay_not_successful"
         exp_dir = os.path.join(unit, "expert")
         n_frames = rec.save(exp_dir, self.fps, cfg.frame_stride, crf=cfg.video_crf)
+        self._save_masks(mr, exp_dir)
         expert_tcp, expert_g, expert_quat = rec.tcp_track(), rec.gripper_track(), rec.quat_track()
         self._set_expert(stream, rec.log["objects"], [e.get_name() for e in rec.actors],
                          self._save_contacts(tr, rec, exp_dir))
@@ -541,11 +557,13 @@ class Generator:
             reset()
             rec = self._recorder(rig)
             tr = self._tracker()
-            ro = Rollout(self.task, rec, cfg.frame_stride, contacts=tr)
+            mk = self._masks(rig)
+            ro = Rollout(self.task, rec, cfg.frame_stride, contacts=tr, masks=mk)
             render_clean(ro, mr)
             cal_dir = os.path.join(unit, "calibration")
             mr["frames"] = rec.save(cal_dir, self.fps, cfg.frame_stride, crf=cfg.video_crf)
             self._save_contacts(tr, rec, cal_dir)
+            self._save_masks(mk, cal_dir)
             mr["filmed"] = _filmed_leg_motion(rec, mr)
             ro.stream().save(os.path.join(cal_dir, "stream.npz"))
             write_json(os.path.join(cal_dir, "move_range.json"), mr)
@@ -725,13 +743,15 @@ class Generator:
         self._reset(seed)
         rec = self._recorder(rig)
         tr = self._tracker()
-        ro = Rollout(self.task, rec, cfg.frame_stride, poll_success=True, contacts=tr)
+        mk = self._masks(rig)
+        ro = Rollout(self.task, rec, cfg.frame_stride, poll_success=True, contacts=tr, masks=mk)
         ro.run(executed)
         succ = ro.success()
         success = succ["final"]
         cf_dir = os.path.join(unit, f"counterfactual_{k:03d}")
         n_frames = rec.save(cf_dir, self.fps, cfg.frame_stride, crf=cfg.video_crf)
         self._save_contacts(tr, rec, cf_dir)
+        self._save_masks(mk, cf_dir)
         executed.save(os.path.join(cf_dir, "stream.npz"))
         meta.update({"episode_type": "counterfactual", "k": k, "seed": seed,
                      "task_success": success, "task_success_ever": succ["ever"],
