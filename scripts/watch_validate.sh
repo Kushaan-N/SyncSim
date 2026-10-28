@@ -14,7 +14,7 @@
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${DATA_ROOT:?set DATA_ROOT}"
-: "${PYTHON:=/scratch/yuncongyang_umass/syncsim/envs/rt/bin/python}"
+: "${PYTHON:=/work/umass/chuangg_umass/yuncongyang_umass/syncsim/envs/rt/bin/python}"
 : "${INTERVAL:=300}"
 : "${ONCE:=0}"
 : "${MONTAGES:=1}"
