@@ -39,7 +39,10 @@ two.
 * **Contact ground truth**, per frame: which robot part (each gripper's fingers and body, each
   arm, the base) touches which object, the table or the other arm, with force and contact
   point; plus contact windows, grasp / hold windows, collisions the rollout caused, and how
-  far each touched object moved. Counterfactual edit points are drawn near the expert's
+  far each touched object moved.
+* **Object masks**, per frame and per camera: a lossless label video next to each RGB video
+  whose pixel values name the part shown (each arm's fingers, gripper and links, every object,
+  the table), with the same part names as the contacts. Counterfactual edit points are drawn near the expert's
   grasps and contacts (`cf_focus_prob`), so most of them change what happens to an object.
 * **Any two-arm embodiment RoboTwin supports**, including mixed pairs (e.g. a Piper left arm
   and a Franka right arm).
@@ -126,6 +129,12 @@ python scripts/contact_stats.py --data_root data --by_task
 python scripts/contact_stats.py --data_root data_v2 --compare data/contact_index.jsonl
 ```
 
+Masks are added the same way (a replay plus a rasterised segmentation render per frame):
+
+```bash
+DATA_ROOT=data N_SHARDS=48 bash scripts/submit_masks.sh
+```
+
 `contact_index.jsonl` (one row per rollout) and `contact_events.jsonl` (one row per contact
 window) are the tables to sample training data from, e.g. every rollout with an arm-object
 collision, or every grasp that ended with the object dropped.
@@ -155,6 +164,9 @@ each rollout directory:
                    task objects, table): touching share of the frame, impulse, contact point
     contacts.json  contact windows (frame x to y, force, object motion during / after),
                    held windows per arm, and a summary (interaction share, event counts)
+    <view>/mask.mkv  per-pixel part ids, frame for frame with <view>/video.mp4 (lossless FFV1;
+                   read with syncsim.masks.read_mask_video)
+    masks.json     pixel value -> part name, and the parts each view shows
 ```
 
 Defaults: 512×512 video at ~20.8 fps (physics at 250 Hz, a frame every 12 steps), two
