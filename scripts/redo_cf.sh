@@ -15,7 +15,7 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(dirname "${SCRIPT_DIR}")"
 : "${LIST:?set LIST to a verify_set.py --exclude_out file}"
-: "${PYTHON:=/scratch/yuncongyang_umass/syncsim/envs/rt/bin/python}"
+: "${PYTHON:=/work/umass/chuangg_umass/yuncongyang_umass/syncsim/envs/rt/bin/python}"
 : "${MAX_PARALLEL:=4}"
 : "${DRY_RUN:=0}"
 
