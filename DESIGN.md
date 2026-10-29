@@ -304,3 +304,29 @@ under `<data root>/_redo_backup/`. Unit-level problems (e.g. a failed wrist moun
 be repaired this way; `scripts/quarantine.py` moves whatever still fails after a redo out of
 the dataset tree (`<data root>/_quarantine/`, reversible), so loaders that walk the tree
 never see it.
+
+## 10. Scaling to the RoboTwin 2.0 release
+
+* **Experts are the release's own.** RoboTwin collects in two stages: plan per seed and save
+  the joint trajectories (`_traj_data/episode<i>.pkl`), then replay them with planning off to
+  record. `rt_env.run_release_expert` is that second stage with SyncSim's stream recorder, so
+  our expert is the release's demonstration (no GPU-nondeterministic re-planning), and every
+  release episode keeps its identity (`release.json`: zip, episode index, seed).
+* **Single-arm pairs need the release's arm spacing**, which the release does not record. It
+  was measured by matching each robot's initial end-effector poses against the release HDF5s:
+  arx-x5 0.6 m, franka 0.8 m, ur5 0.8 m (all match to 0.1 mm; ur5 at 0.6 m even makes some
+  seeds unstable). They live in `rt_env.RELEASE_EMBODIMENTS`.
+* **Scene check.** The replay's scene info (object ids, clutter, textures) is compared with the
+  release's `scene_info.json`. Clean scenes match; in randomized scenes a few clutter objects
+  can differ (asset-version drift since the release), which `scene_matches_release` flags.
+  The expert must still succeed in our scene, as for every SyncSim expert.
+* **Fetching.** Only the small members of each release zip are needed, each read with one
+  HTTP range request (huggingface_hub's filesystem spent ~80 s per open here, and block-wise
+  reads cost one request per 128 KB). Run it from a compute node: dozens of parallel
+  streams saturated the login node.
+* **Throughput.** Rendering (ray tracing) is the bottleneck: one RTX PRO 6000 is ~96% busy
+  with 4 workers. `scripts/queue_worker.py` spreads ~10-episode items over all workers in
+  roughly FIFO order (clean before randomized), interleaving tasks and robots so a partial
+  run is balanced. Claims are `mkdir`s with a heartbeat; a claim idle for 15 min is taken
+  over, so preempted jobs lose at most the episode in flight.
+
