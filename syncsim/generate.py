@@ -153,6 +153,8 @@ class Config:
                                              # replay its saved expert trajectories instead of planning;
                                              # seed_start / num_seeds then index its EPISODES
     release_embodiment_dis: float = 0.0      # single-arm pairs: arm spacing; 0 = RoboTwin's default
+    release_fallback_plan: bool = True       # a release trajectory that no longer succeeds here is
+                                             # re-planned on the same seed (release.json: expert_source)
 
 
 def _parse_probs(s):
@@ -531,6 +533,14 @@ class Generator:
                     traj = pickle.load(f)
                 paths = {"left": traj["left_joint_path"], "right": traj["right_joint_path"]}
                 ok, reason, stream, paths, info = rt.run_release_expert(self.task, self.args, seed, paths)
+                self._expert_source = "release"
+                if not ok and cfg.release_fallback_plan:
+                    print(f"    [release] episode {ep_id} (seed {seed}): {reason} -- re-planning")
+                    self.rt.close_task(self.task)
+                    ok, reason, stream, paths, info = rt.run_expert(self.task, self.args, seed)
+                    self._expert_source = "replanned"
+                    if not ok:
+                        reason = f"release_and_replan_failed: {reason}"
             else:
                 ok, reason, stream, paths, info = rt.run_expert(self.task, self.args, seed)
         except UnStableError as e:
@@ -568,6 +578,7 @@ class Generator:
             "source": "RoboTwin 2.0 release (huggingface TianxingChen/RoboTwin2.0)",
             "release_dir": r["dir"], "embodiment": r["embodiment"], "variant": r["variant"],
             "episode": ep_id, "seed": seed,
+            "expert_source": getattr(self, "_expert_source", "release"),
             "scene_matches_release": ref is not None and _jsonable(info) == _jsonable(ref),
             "scene_info_release": ref, "scene_info_replay": _jsonable(info)})
 
