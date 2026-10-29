@@ -41,6 +41,9 @@ scripts/submit_contacts.sh    SLURM array of annotate_contacts.py shards over a 
 scripts/contact_stats.py      contact_index.jsonl / contact_events.jsonl + per-mode interaction numbers
 scripts/annotate_masks.py     add masks to existing rollouts by replay + segmentation render
 scripts/submit_masks.sh       SLURM array of annotate_masks.py shards over a data root
+scripts/fetch_robotwin_release.py  seeds / scene info / planner trajectories of the RoboTwin 2.0 release
+scripts/queue_worker.py       shared work queue (build / work / status) for release-scale runs
+scripts/queue.sbatch          one node of a queue run: WORKERS_PER_GPU workers per GPU
 ```
 
 ## Environment (AICR cluster)
@@ -82,5 +85,7 @@ scripts/submit_masks.sh       SLURM array of annotate_masks.py shards over a dat
   what the ray tracer does not, and wrist cameras see held objects from a few cm.
 - Task-space edits solve IK once per edit point and bound the trajectory-wide TCP effect;
   don't go back to per-frame IK along a trajectory (IK-branch flips -> m/s spikes).
+- Release experts (`--release_dir`) replay the release's saved trajectories; single-arm pairs
+  need the release's arm spacing (`rt_env.RELEASE_EMBODIMENTS`, measured: don't guess).
 - `actions.npy` is `[T, 16]` = per arm (TCP xyz, quat xyzw, gripper opening); layout is in
   `base_init.json["action_layout"]`. Change it only together with that layout.
