@@ -121,6 +121,12 @@ build_args() {
 }
 build_args
 
+# the run defaults as NUL-separated generator flags (scripts/queue_worker.py reads these)
+if [[ "${EMIT_ARGS:-0}" == 1 ]]; then
+  printf '%s\0' "${ARGS[@]}"
+  exit 0
+fi
+
 if [[ "${PRINT_CONFIG}" == 1 ]]; then
   echo "SET_DIR=${SET_DIR} seeds=[${SEED_START}, $((SEED_START + SEEDS_PER_SET)))"
   echo "TASKS(${#TASK_ARR[@]})=${TASKS}"
