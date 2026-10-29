@@ -223,8 +223,10 @@ def _load_release(cfg):
             cfg.embodiment = f"{e[0]},{e[1]},{dis}"
     with open(os.path.join(d, "seed.txt")) as f:
         seeds = [int(x) for x in f.read().split()]
-    with open(os.path.join(d, "scene_info.json")) as f:
-        scene_info = json.load(f)
+    scene_info = None                         # a few release zips ship without it
+    if os.path.exists(os.path.join(d, "scene_info.json")):
+        with open(os.path.join(d, "scene_info.json")) as f:
+            scene_info = json.load(f)
     return {"dir": d, "embodiment": emb, "variant": variant, "seeds": seeds, "scene_info": scene_info}
 
 
@@ -570,7 +572,7 @@ class Generator:
         """Provenance of a release expert + whether our replay rebuilt the release's scene."""
         from .recorder import write_json
         r = self.release
-        ref = r["scene_info"].get(f"episode_{ep_id}")
+        ref = (r["scene_info"] or {}).get(f"episode_{ep_id}")
         instr = os.path.join(r["dir"], "instructions", f"episode{ep_id}.json")
         if os.path.exists(instr):
             shutil.copyfile(instr, os.path.join(ep_dir, "instructions.json"))
@@ -579,7 +581,7 @@ class Generator:
             "release_dir": r["dir"], "embodiment": r["embodiment"], "variant": r["variant"],
             "episode": ep_id, "seed": seed,
             "expert_source": getattr(self, "_expert_source", "release"),
-            "scene_matches_release": ref is not None and _jsonable(info) == _jsonable(ref),
+            "scene_matches_release": None if ref is None else _jsonable(info) == _jsonable(ref),
             "scene_info_release": ref, "scene_info_replay": _jsonable(info)})
 
     def unit(self, seed, m, unit, stream, info):
