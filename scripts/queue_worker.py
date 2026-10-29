@@ -17,6 +17,7 @@ at most the episode in flight.
     python scripts/queue_worker.py build --queue Q --release_root R --output_root O [--chunk 10]
     python scripts/queue_worker.py work  --queue Q --gpu 0 [--worker_id host-0]
     python scripts/queue_worker.py status --queue Q
+    python scripts/queue_worker.py requeue --queue Q --reason release_replay_not_successful
 
 `work` runs `python -m syncsim.generate` per item with the run defaults of scripts/gen_set.sh
 (EMIT_ARGS=1), then the item's task / release dir / episode range / output dir.
@@ -217,6 +218,42 @@ def work(a):
         print(f"[worker {owner}] {it['id']} rc={rc} in {dt:.0f}s", flush=True)
 
 
+def requeue(a):
+    """Retry dropped episodes whose drop reason starts with --reason: forget the drops and
+    un-finish their items (the generator skips the episodes that are already complete)."""
+    n_ep = n_items = 0
+    for it in _load_items(a.queue):
+        sid = _safe(it["id"])
+        if not os.path.exists(os.path.join(a.queue, "done", sid)):
+            continue
+        if os.path.isdir(os.path.join(a.queue, "claims", sid)):
+            continue
+        dpath = os.path.join(it["output_dir"], it["task"], "_dropped.json")
+        if not os.path.exists(dpath):
+            continue
+        with open(os.path.join(it["release_dir"], "seed.txt")) as f:
+            seeds = {str(x) for x in f.read().split()[it["start"]:it["start"] + it["count"]]}
+        with open(dpath) as f:
+            drops = json.load(f)
+        hit = [k for k, v in drops.items() if k in seeds and v.startswith(a.reason)]
+        if not hit:
+            continue
+        n_ep += len(hit)
+        n_items += 1
+        if a.dry_run:
+            continue
+        for k in hit:
+            drops.pop(k)
+        with open(dpath + ".tmp", "w") as f:
+            json.dump(drops, f, indent=1)
+        os.replace(dpath + ".tmp", dpath)
+        os.remove(os.path.join(a.queue, "done", sid))
+        fp = os.path.join(a.queue, "fail", sid)
+        if os.path.exists(fp):
+            os.remove(fp)
+    print(f"[requeue] {n_ep} episode(s) in {n_items} item(s){' (dry run)' if a.dry_run else ''}")
+
+
 def status(a):
     items = _load_items(a.queue)
     done = {}
@@ -260,10 +297,14 @@ def main():
     w.add_argument("extra", nargs=argparse.REMAINDER, help="extra generator flags after --")
     s = sub.add_parser("status")
     s.add_argument("--queue", required=True)
+    r = sub.add_parser("requeue")
+    r.add_argument("--queue", required=True)
+    r.add_argument("--reason", required=True, help="drop-reason prefix, e.g. release_replay_not_successful")
+    r.add_argument("--dry_run", action="store_true")
     a = p.parse_args()
     if getattr(a, "extra", None) and a.extra[:1] == ["--"]:
         a.extra = a.extra[1:]
-    {"build": build, "work": work, "status": status}[a.cmd](a)
+    {"build": build, "work": work, "status": status, "requeue": requeue}[a.cmd](a)
 
 
 if __name__ == "__main__":
