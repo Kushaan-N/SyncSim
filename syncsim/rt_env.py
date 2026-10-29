@@ -291,3 +291,27 @@ def run_expert(task, args, seed):
         return False, f"joint_limit_excess_{excess:.3f}", stream, None, info
     paths = {"left": deepcopy(task.left_joint_path), "right": deepcopy(task.right_joint_path)}
     return True, "ok", stream, paths, info
+
+
+def run_release_expert(task, args, seed, joint_paths):
+    """Replay a RoboTwin 2.0 release expert: set up its `seed` and run `play_once` on the saved
+    planner trajectories (`_traj_data/episode<i>.pkl`) with planning off -- exactly RoboTwin's
+    own collection stage 2. Returns (ok, reason, stream, joint_paths, info) like run_expert."""
+    setup_task(task, args, seed, need_plan=False, joint_paths=joint_paths)
+    with StreamRecorder(task) as rec:
+        info = task.play_once()
+    stream = rec.stream()
+    if not task.plan_success:
+        return False, "release_path_exhausted", stream, None, info
+    if not task.check_success():
+        return False, "release_replay_not_successful", stream, None, info
+    return True, "ok", stream, joint_paths, info
+
+
+# release embodiment name -> RoboTwin embodiment list (single-arm robots come as a pair)
+RELEASE_EMBODIMENTS = {
+    "aloha-agilex": ["aloha-agilex"],
+    "arx-x5": ["ARX-X5", "ARX-X5", 0.6],          # spacing measured against the release
+    "franka": ["franka-panda", "franka-panda", 0.8],
+    "ur5": ["ur5-wsg", "ur5-wsg", 0.8],
+}
