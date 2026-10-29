@@ -42,10 +42,10 @@ REPO="$(cd "${SCRIPT_DIR}/.." && pwd)"
 : "${CLUTTERED_TABLE:=}"
 : "${RANDOM_LIGHT:=}"
 # rendering
-: "${IMAGE_SIZE:=512}"
+: "${IMAGE_SIZE:=384}"               # 512 -> 384 + RT_SPP 32 -> 8: 2.8x faster, 36-38 dB vs 32/512 (RoboTwin release scale-up)
 : "${FRAME_STRIDE:=12}"              # 250 Hz physics / 12 = 20.8 fps (robocasa: 20 Hz)
 : "${SHADER:=rt}"
-: "${RT_SPP:=32}"
+: "${RT_SPP:=8}"
 : "${RECORD_WRIST:=true}"
 # 3rd-person rig
 : "${NUM_CAMERA_UNITS:=1}"
