@@ -148,6 +148,11 @@ class Config:
     diverge_tail_steps: int = 120
     # ---- repair mode --------------------------------------------------------------------------
     redo_list: str = ""                      # file of counterfactual dirs to regenerate in place
+    # ---- RoboTwin 2.0 release experts ----------------------------------------------------------
+    release_dir: str = ""                    # <release>/<task>/<emb>_<variant> (scripts/fetch_robotwin_release.py):
+                                             # replay its saved expert trajectories instead of planning;
+                                             # seed_start / num_seeds then index its EPISODES
+    release_embodiment_dis: float = 0.0      # single-arm pairs: arm spacing; 0 = RoboTwin's default
 
 
 def _parse_probs(s):
@@ -192,6 +197,37 @@ def _embodiment(cfg):
     if len(parts) == 3:
         return [parts[0], parts[1], float(parts[2])]
     return parts
+
+
+def _load_release(cfg):
+    """Seeds / scene info of a fetched release dir, and the task config + embodiment it was
+    collected with (set on `cfg` unless given explicitly)."""
+    from .rt_env import RELEASE_EMBODIMENTS
+    d = cfg.release_dir.rstrip("/")
+    emb, _, variant = os.path.basename(d).partition("_")
+    if os.path.basename(os.path.dirname(d)) != cfg.task:
+        raise ValueError(f"release dir {d} is not for task {cfg.task}")
+    if not os.path.exists(os.path.join(d, "_COMPLETE")):
+        raise FileNotFoundError(f"release dir {d} is incomplete (no _COMPLETE)")
+    cfg.task_config = {"clean": "demo_clean", "randomized": "demo_randomized"}[variant.split("_")[0]]
+    if not cfg.embodiment:
+        e = RELEASE_EMBODIMENTS[emb]
+        if len(e) == 1:
+            cfg.embodiment = e[0]
+        else:
+            dis = cfg.release_embodiment_dis or e[2]
+            if not dis:
+                raise ValueError(f"{emb}: arm spacing unknown, pass --release_embodiment_dis")
+            cfg.embodiment = f"{e[0]},{e[1]},{dis}"
+    with open(os.path.join(d, "seed.txt")) as f:
+        seeds = [int(x) for x in f.read().split()]
+    with open(os.path.join(d, "scene_info.json")) as f:
+        scene_info = json.load(f)
+    return {"dir": d, "embodiment": emb, "variant": variant, "seeds": seeds, "scene_info": scene_info}
+
+
+def _jsonable(x):
+    return json.loads(json.dumps(x, default=str))
 
 
 def _unit_rng(cfg, seed, m, tag):
@@ -271,6 +307,7 @@ class Generator:
         self.cfg = cfg
         self.root = rt_env.enter_robotwin()
         self.rt = rt_env
+        self.release = _load_release(cfg) if cfg.release_dir else None
         self.args = rt_env.build_task_args(cfg.task, cfg.task_config, _embodiment(cfg),
                                            overrides=_domain_overrides(cfg))
         self.task = rt_env.make_task(cfg.task)
@@ -351,14 +388,22 @@ class Generator:
         return 1.0 / (self.task.scene.get_timestep() * self.cfg.frame_stride)
 
     # ------------------------------------------------------------------------------------
+    def _episodes(self):
+        """(episode id, sim seed) pairs to generate: seeds themselves, or release episodes."""
+        ids = range(self.cfg.seed_start, self.cfg.seed_start + self.cfg.num_seeds)
+        if not self.release:
+            return [(s, s) for s in ids]
+        seeds = self.release["seeds"]
+        return [(i, seeds[i]) for i in ids if i < len(seeds)]
+
     def run(self):
         cfg = self.cfg
         kept = 0
         t_start = time.time()
-        for seed in range(cfg.seed_start, cfg.seed_start + cfg.num_seeds):
+        for ep_id, seed in self._episodes():
             if cfg.max_episodes and kept >= cfg.max_episodes:
                 break
-            ep_dir = os.path.join(self.task_dir, f"episode_{seed}")
+            ep_dir = os.path.join(self.task_dir, f"episode_{ep_id}")
             if not cfg.overwrite and self._episode_complete(ep_dir):
                 kept += 1
                 print(f"[skip] {cfg.task} seed {seed}: complete")
@@ -368,7 +413,7 @@ class Generator:
                 continue
             t0 = time.time()
             try:
-                ok = self.episode(seed, ep_dir)
+                ok = self.episode(seed, ep_dir, ep_id)
             except Exception as e:
                 traceback.print_exc()
                 ok = False
@@ -476,11 +521,18 @@ class Generator:
                    for m in range(self.cfg.num_camera_units))
 
     # ------------------------------------------------------------------------------------
-    def episode(self, seed, ep_dir):
+    def episode(self, seed, ep_dir, ep_id=None):
         cfg, rt = self.cfg, self.rt
         from envs.utils.create_actor import UnStableError
         try:
-            ok, reason, stream, paths, info = rt.run_expert(self.task, self.args, seed)
+            if self.release:
+                import pickle
+                with open(os.path.join(cfg.release_dir, "_traj_data", f"episode{ep_id}.pkl"), "rb") as f:
+                    traj = pickle.load(f)
+                paths = {"left": traj["left_joint_path"], "right": traj["right_joint_path"]}
+                ok, reason, stream, paths, info = rt.run_release_expert(self.task, self.args, seed, paths)
+            else:
+                ok, reason, stream, paths, info = rt.run_expert(self.task, self.args, seed)
         except UnStableError as e:
             self._drop(seed, f"unstable_scene: {e}"[:300])
             return False
@@ -500,7 +552,24 @@ class Generator:
             shutil.rmtree(ep_dir, ignore_errors=True)
             self._drop(seed, reasons[0] if reasons else "no_unit_kept")
             return False
+        if self.release:
+            self._save_release(ep_dir, ep_id, seed, info)
         return True
+
+    def _save_release(self, ep_dir, ep_id, seed, info):
+        """Provenance of a release expert + whether our replay rebuilt the release's scene."""
+        from .recorder import write_json
+        r = self.release
+        ref = r["scene_info"].get(f"episode_{ep_id}")
+        instr = os.path.join(r["dir"], "instructions", f"episode{ep_id}.json")
+        if os.path.exists(instr):
+            shutil.copyfile(instr, os.path.join(ep_dir, "instructions.json"))
+        write_json(os.path.join(ep_dir, "release.json"), {
+            "source": "RoboTwin 2.0 release (huggingface TianxingChen/RoboTwin2.0)",
+            "release_dir": r["dir"], "embodiment": r["embodiment"], "variant": r["variant"],
+            "episode": ep_id, "seed": seed,
+            "scene_matches_release": ref is not None and _jsonable(info) == _jsonable(ref),
+            "scene_info_release": ref, "scene_info_replay": _jsonable(info)})
 
     def unit(self, seed, m, unit, stream, info):
         cfg = self.cfg
