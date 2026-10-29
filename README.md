@@ -139,6 +139,39 @@ DATA_ROOT=data N_SHARDS=48 bash scripts/submit_masks.sh
 window) are the tables to sample training data from, e.g. every rollout with an arm-object
 collision, or every grasp that ended with the object dropped.
 
+### The RoboTwin 2.0 release as experts (large-scale runs)
+
+Instead of planning its own experts, SyncSim can replay the ~110k expert demonstrations of the
+[RoboTwin 2.0 dataset](https://huggingface.co/datasets/TianxingChen/RoboTwin2.0) (50 tasks;
+aloha-agilex, arx-x5, franka and ur5; 50 clean + 500 domain-randomized episodes each) and add
+its cameras, calibration, counterfactuals, contacts and masks to every one of them. Only the
+seeds, scene info, planner trajectories and instructions are fetched (~10 GB, read straight
+out of the remote zips), never the release's HDF5s:
+
+```bash
+python scripts/fetch_robotwin_release.py --out <release_root> --workers 24
+python -m syncsim.generate --task lift_pot --release_dir <release_root>/lift_pot/franka_clean_50 \
+    --output_dir data_rt2/franka_clean_50 --seed_start 0 --num_seeds 5    # release episodes 0-4
+```
+
+`--seed_start / --num_seeds` then index the release's episodes; the embodiment and task
+config come from the directory name. Each episode gets `release.json` (seed, provenance, and
+whether our replay rebuilt the release's scene exactly) and the release's `instructions.json`.
+
+For the whole release, a shared work queue keeps every GPU busy across any number of SLURM
+jobs (claims are atomic, stale claims are taken over, the generator resumes from `_DONE`), so
+jobs can be preempted, cancelled or added at any time:
+
+```bash
+python scripts/queue_worker.py build --queue <q> --release_root <release_root> --output_root data_rt2 --variants clean_50
+python scripts/queue_worker.py build --queue <q> --release_root <release_root> --output_root data_rt2 --variants randomized_500
+QUEUE=<q> WORKERS_PER_GPU=4 sbatch -p <partition> -A <account> --gres gpu:2 -c 32 --mem 240G \
+    --array 0-15 --export ALL scripts/queue.sbatch
+python scripts/queue_worker.py status --queue <q>
+```
+
+Workers use the run defaults of `scripts/gen_set.sh`, re-read before every item.
+
 ## Output
 
 ```
