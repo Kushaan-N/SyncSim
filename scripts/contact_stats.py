@@ -20,6 +20,7 @@ clutter), as a share of frames and of rollouts. A generator change that is meant
 move these up for the modes it touches; --compare <old contact_index.jsonl> prints the delta.
 
     python scripts/contact_stats.py --data_root <data> [--by_task] [--compare old.jsonl]
+    python scripts/contact_stats.py --data_root <release run> --set_glob '*' --done_only
 """
 
 import argparse
@@ -149,19 +150,34 @@ def main():
     ap.add_argument("--out_dir", default="")
     ap.add_argument("--by_task", action="store_true")
     ap.add_argument("--compare", default="", help="an older contact_index.jsonl")
+    ap.add_argument("--set_glob", default="set_*",
+                    help="set dirs under the root ('*' for a release run: <emb>_<variant>/)")
+    ap.add_argument("--done_only", action="store_true",
+                    help="only units with _DONE (a run still writing)")
+    ap.add_argument("--workers", type=int, default=16)
     a = ap.parse_args()
     root = os.path.abspath(a.data_root)
     out_dir = a.out_dir or root
     rows, events = [], []
-    for p in sorted(glob.glob(os.path.join(root, "set_*", "*", "episode_*", "camera_poses_*",
-                                           "*", "contacts.json"))):
+    paths = sorted(glob.glob(os.path.join(root, a.set_glob, "*", "episode_*", "camera_poses_*",
+                                          "*", "contacts.json")))
+    if a.done_only:
+        paths = [p for p in paths
+                 if os.path.exists(os.path.join(os.path.dirname(os.path.dirname(p)), "_DONE"))]
+
+    def load(p):
         try:
-            r, e = row_of(os.path.dirname(p), root)
+            return row_of(os.path.dirname(p), root)
         except Exception as ex:          # a half-written file from a running job
             print(f"skip {p}: {ex}")
-            continue
-        rows.append(r)
-        events.extend(e)
+            return None
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(a.workers) as ex:
+        for res in ex.map(load, paths):
+            if res is not None:
+                rows.append(res[0])
+                events.extend(res[1])
     if not rows:
         raise SystemExit(f"no contacts.json under {root}")
     add_novelty(rows, root)
