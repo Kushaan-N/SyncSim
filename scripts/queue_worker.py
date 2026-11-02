@@ -4,7 +4,8 @@
 A queue is a directory on a shared filesystem:
 
     <queue>/items.jsonl     one work item per line: {"id", "task", "release_dir", "output_dir",
-                            "start", "count"}  (built by `build`)
+                            "start", "count"}  (built by `build`); a repair item instead has
+                            "redo_list" (+ optional "redo_args"): generate.py --redo_list
     <queue>/claims/<id>/    a worker owns the item; owner.json + heartbeat mtime
     <queue>/done/<id>       item finished (the generator exited 0)
     <queue>/fail/<id>       failure count + last log tail
@@ -189,9 +190,12 @@ def work(a):
         # re-read the run defaults per item, so a default changed mid-run (gen_set.sh) applies
         # to every item started afterwards
         cmd = [PYTHON, "-m", "syncsim.generate", *_base_args(), "--task", it["task"],
-               "--release_dir", it["release_dir"], "--output_dir", it["output_dir"],
-               "--seed_start", str(it["start"]), "--num_seeds", str(it["count"]),
-               "--max_episodes", "0"] + a.extra
+               "--release_dir", it["release_dir"], "--output_dir", it["output_dir"]]
+        if it.get("redo_list"):   # repair item: regenerate the listed counterfactuals in place
+            cmd += ["--redo_list", it["redo_list"], *it.get("redo_args", [])] + a.extra
+        else:
+            cmd += ["--seed_start", str(it["start"]), "--num_seeds", str(it["count"]),
+                    "--max_episodes", "0"] + a.extra
         env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(a.gpu), PYTHONUNBUFFERED="1",
                    PYTHONWARNINGS="ignore", OMP_NUM_THREADS=str(a.threads),
                    MKL_NUM_THREADS=str(a.threads))
