@@ -115,11 +115,18 @@ def gripper_open_of(rollout_dir):
     return {a: np.asarray(P[f"{a}_gripper_open"]) for a in ("left", "right")}
 
 
-def rederive(units, kinds, suffix):
+def rederive(units, kinds, suffix, finger_parts=("finger",), workers=1):
     """Recompute <name>.json from the saved <name>.npz with the CURRENT event code (no
     simulation, no GPU): picks up label / event fixes on already-annotated data. The replay
     check, source and commit of the original annotation are kept; the dense arrays are not
     rewritten, so v1 part names stay as recorded and are relabelled on read."""
+    if workers > 1:
+        from concurrent.futures import ProcessPoolExecutor
+        with ProcessPoolExecutor(workers) as ex:
+            list(ex.map(rederive, [[u] for u in units], [kinds] * len(units), [suffix] * len(units),
+                        [finger_parts] * len(units), chunksize=32))
+        print(f"[contacts] rederived {len(units)} unit(s) with {workers} workers")
+        return
     from syncsim.contacts import events
     n = 0
     for u in units:
@@ -128,10 +135,15 @@ def rederive(units, kinds, suffix):
             npz, js = os.path.join(rdir, f"{name}.npz"), os.path.join(rdir, f"{name}.json")
             if not os.path.exists(npz):
                 continue
-            A = dict(np.load(npz))
-            z = np.load(os.path.join(rdir, "object_poses.npz"))
-            old = json.load(open(js)) if os.path.exists(js) else {}
-            ev = events(A, z["poses"], z["names"], gripper_open=gripper_open_of(rdir))
+            try:
+                A = dict(np.load(npz))
+                z = np.load(os.path.join(rdir, "object_poses.npz"))
+                old = json.load(open(js)) if os.path.exists(js) else {}
+            except (OSError, ValueError) as e:      # rollout being rewritten (redo) / unreadable
+                print(f"[contacts] skip {rdir}: {type(e).__name__}: {e}", flush=True)
+                continue
+            ev = events(A, z["poses"], z["names"], gripper_open=gripper_open_of(rdir),
+                        finger_parts=finger_parts)
             for k in ("source", "syncsim_commit", "replay_check"):
                 if k in old:
                     ev[k] = old[k]
@@ -139,6 +151,8 @@ def rederive(units, kinds, suffix):
             if fixed:
                 ev["fixed_objects"] = fixed
             ev["rederived"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+            if tuple(finger_parts) != ("finger",):
+                ev["finger_parts"] = list(finger_parts)
             tmp = js + ".tmp"
             with open(tmp, "w") as f:
                 json.dump(ev, f, indent=1)
@@ -163,11 +177,16 @@ def main():
     ap.add_argument("--suffix", default="",
                     help="write contacts<suffix>.npz/json instead (e.g. _offline, to compare "
                          "with live-recorded contacts without overwriting them)")
+    ap.add_argument("--set_glob", default="set_*", help="set dir pattern under --data_root")
+    ap.add_argument("--finger_parts", default="finger",
+                    help="--rederive: part suffixes that can hold (finger,gripper for ur5 rollouts "
+                         "recorded before its pads were labelled fingers)")
+    ap.add_argument("--workers", type=int, default=1, help="--rederive: parallel processes")
     a = ap.parse_args()
 
     kinds = set(a.kinds.split(","))
     si, sn = map(int, a.shard.split("/"))
-    pat = os.path.join(a.data_root, "set_*", a.task or "*", "episode_*", "camera_poses_*", "_DONE")
+    pat = os.path.join(a.data_root, a.set_glob, a.task or "*", "episode_*", "camera_poses_*", "_DONE")
     units = sorted(os.path.dirname(p) for p in glob.glob(pat))
     if a.units_file:
         want = {os.path.abspath(l.strip()) for l in open(a.units_file) if l.strip()}
@@ -181,7 +200,7 @@ def main():
     if a.limit:
         units = units[:a.limit]
     if a.rederive:
-        return rederive(units, kinds, a.suffix)
+        return rederive(units, kinds, a.suffix, tuple(a.finger_parts.split(",")), a.workers)
     from syncsim.generate import Config, Generator
     from syncsim.rt_env import ControlStream
     try:
