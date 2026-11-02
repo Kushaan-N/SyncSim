@@ -415,3 +415,76 @@ def divergence(expert_tcp, cf_tcp, expert_g, cf_g, expert_quat=None, cf_quat=Non
         if r is not None:
             out[arm]["max_rot_deg"] = float(r[:, j].max())
     return out
+
+
+def reasonableness(mode, arms, bp_frame, expert_tcp, cf_tcp, expert_obj, cf_obj, obj_names,
+                   clutter_names, fps, cfg):
+    """Checks that a counterfactual is a credible variation of THIS task (the audit rules of
+    the release-scale run). Returns the list of failed checks ([] = reasonable).
+      object_flung    an object moves faster than cfg.cf_max_object_speed_mps and 2x the expert's
+      wander          (not freeze_arm) a perturbed TCP gets > cfg.cf_max_wander_m from the expert
+      away_from_task  (noisy_replay / scripted_diverge) a perturbed gripper stays on average
+                      > cfg.cf_max_away_m further from every task object than the expert's
+      clutter_smash   a distractor moves > cfg.cf_max_clutter_extra_m more than in the expert
+      frozen_arm_moved (freeze_arm) the frozen TCP moves > cfg.cf_max_frozen_move_m
+    expert_tcp/cf_tcp [T, 2, 3]; expert_obj/cf_obj [T, O, >=3] in the same object order."""
+    fails = []
+    et, ct = np.asarray(expert_tcp), np.asarray(cf_tcp)
+    n = min(len(et), len(ct))
+    bp = int(bp_frame or 0)
+    pert = [j for j, a in enumerate(("left", "right")) if a in arms_of(arms)]
+    # object bookkeeping (task objects vs distractors) when both tracks have the same objects
+    eo = co = None
+    if expert_obj is not None and cf_obj is not None and np.size(expert_obj) and np.size(cf_obj):
+        eo, co = np.asarray(expert_obj)[:, :, :3], np.asarray(cf_obj)[:, :, :3]
+        if eo.shape[1] != co.shape[1]:
+            eo = co = None
+    names = [str(x) for x in (obj_names if obj_names is not None else range(0 if eo is None else eo.shape[1]))]
+    clutter = set(clutter_names or ())
+    cl = [i for i, x in enumerate(names) if x in clutter]
+    tk = [i for i, x in enumerate(names) if x not in clutter]
+    # away = how much further (mean after the breakpoint) the perturbed gripper keeps from the
+    # nearest task object than the expert's does
+    away = 0.0
+    if eo is not None and tk and len(ct) > bp and n > bp:
+        near = lambda tcp, o, j, hi: np.linalg.norm(o[bp:hi, tk] - tcp[bp:hi, j][:, None], axis=2).min(axis=1).mean()
+        away = min(near(ct, co, j, len(ct)) for j in pert) - min(near(et, eo, j, n) for j in pert)
+    if mode == "freeze_arm":
+        if len(ct) > bp and max(np.linalg.norm(ct[bp:, j] - ct[bp, j], axis=1).max() for j in pert) \
+                > cfg.cf_max_frozen_move_m:
+            fails.append("frozen_arm_moved")
+    elif n > bp:
+        dev = np.stack([np.linalg.norm(ct[bp:n, j] - et[bp:n, j], axis=1) for j in pert])   # [arms, t]
+        if dev.max() > cfg.cf_max_wander_m or ((dev > 0.25).mean(axis=1).max() > 0.5 and away > 0.10):
+            fails.append("wander")
+    if eo is None:
+        return fails
+    sp = lambda o: (np.linalg.norm(np.diff(o, axis=0), axis=2).max() * fps) if len(o) > 1 else 0.0
+    if sp(co) > max(cfg.cf_max_object_speed_mps, 2 * sp(eo)):
+        fails.append("object_flung")
+    if cl:
+        disp = lambda o: np.linalg.norm(o[:, cl] - o[0, cl], axis=2).max(axis=0)
+        if (disp(co) - disp(eo)).max() > cfg.cf_max_clutter_extra_m:
+            fails.append("clutter_smash")
+    if mode in ("noisy_replay", "scripted_diverge") and away > cfg.cf_max_away_m:
+        fails.append("away_from_task")
+    return fails
+    eo, co = np.asarray(expert_obj)[:, :, :3], np.asarray(cf_obj)[:, :, :3]
+    if eo.shape[1] != co.shape[1]:
+        return fails
+    names = [str(x) for x in (obj_names if obj_names is not None else range(eo.shape[1]))]
+    clutter = set(clutter_names or ())
+    cl = [i for i, x in enumerate(names) if x in clutter]
+    tk = [i for i, x in enumerate(names) if x not in clutter]
+    sp = lambda o: (np.linalg.norm(np.diff(o, axis=0), axis=2).max() * fps) if len(o) > 1 else 0.0
+    if sp(co) > max(cfg.cf_max_object_speed_mps, 2 * sp(eo)):
+        fails.append("object_flung")
+    if cl:
+        disp = lambda o: np.linalg.norm(o[:, cl] - o[0, cl], axis=2).max(axis=0)
+        if (disp(co) - disp(eo)).max() > cfg.cf_max_clutter_extra_m:
+            fails.append("clutter_smash")
+    if mode in ("noisy_replay", "scripted_diverge") and tk and n > bp:
+        near = lambda tcp, o, j: np.linalg.norm(o[bp:n, tk] - tcp[bp:n, j][:, None], axis=2).min(axis=1).mean()
+        if min(near(ct, co, j) - near(et, eo, j) for j in pert) > cfg.cf_max_away_m:
+            fails.append("away_from_task")
+    return fails
