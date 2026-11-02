@@ -104,10 +104,13 @@ def robot_part_map(robot):
         palm = grip[0][0].get_parent_link()
         for link in _subtree(art, palm):
             parts[_eid(link)] = f"{arm}_gripper"
+        # fix_gripper_name (ur5-wsg only) are the finger pads, fixed to the prismatic sliders:
+        # they are what touches a grasped object, so they are fingers (labelled "gripper"
+        # before 2026-11-02, which hid every ur5 grasp from the held windows)
         for name in getattr(robot, f"{arm}_fix_gripper_name", []) or []:
             link = art.find_link_by_name(name)
             if link is not None:
-                parts[_eid(link)] = f"{arm}_gripper"
+                parts[_eid(link)] = f"{arm}_finger"
         for j, _, _ in grip:
             parts[_eid(j.get_child_link())] = f"{arm}_finger"
     return parts
@@ -279,12 +282,14 @@ def _disp(track, a, b):
 
 
 def events(A, object_poses=None, object_names=None, after_frames=10, lift_m=0.01,
-           gripper_open=None):
+           gripper_open=None, finger_parts=("finger",)):
     """Contact windows and per-rollout interaction summary. `object_poses` [T, O, 7] (xyz +
     quat) and `object_names` [O] (actor names, as in object_poses.npz, in recorder order) add
     object motion; repeated names are disambiguated exactly as the tracker's labels are.
     `gripper_open` {arm: [T] commanded opening in [0, 1]}: held needs that gripper closed.
-    v1 part labels (env:<task object>) are mapped to fix: on the fly (`relabel`)."""
+    v1 part labels (env:<task object>) are mapped to fix: on the fly (`relabel`).
+    `finger_parts`: robot part suffixes that can hold an object; ("finger", "gripper") for
+    ur5 rollouts recorded before its finger pads were labelled as fingers."""
     pa = [relabel(str(x)) for x in A["pair_a"]]
     pb = [relabel(str(x)) for x in A["pair_b"]]
     kind = [pair_kind(a, b) for a, b in zip(pa, pb)]
@@ -327,7 +332,7 @@ def events(A, object_poses=None, object_names=None, after_frames=10, lift_m=0.01
     # ---- per arm: held / grasp windows ------------------------------------------------
     held = {}
     for arm in ("left", "right"):
-        fing = [j for j in range(len(pa)) if f"{arm}_finger" in (pa[j], pb[j])
+        fing = [j for j in range(len(pa)) if any(f"{arm}_{fp}" in (pa[j], pb[j]) for fp in finger_parts)
                 and obj_of(pa[j], pb[j])]
         by_obj = {}
         for j in fing:
