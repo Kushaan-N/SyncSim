@@ -117,6 +117,17 @@ class Config:
     cf_max_tcp_speed_mps: float = 1.0        # plausibility: no TCP faster than this ...
     cf_expert_speed_margin: float = 1.5      # ... unless the expert itself is (then 1.5x its peak)
     cf_max_attempts: int = 3
+    # reasonableness gate (counterfactual.reasonableness): an attempt must stay a credible
+    # variation of the task -- the rules of the release-scale counterfactual audit
+    cf_reasonable_gate: bool = True
+    cf_require_reasonable: bool = False      # no reasonable attempt -> raise (redo keeps the original)
+    cf_max_object_speed_mps: float = 4.0     # ... no object faster than this (and 2x the expert's)
+    cf_max_wander_m: float = 0.45            # ... perturbed TCP within this of the expert's
+    cf_max_away_m: float = 0.20              # ... gripper not this much further from task objects
+    cf_max_clutter_extra_m: float = 0.15     # ... distractors not moved this much more than by the expert
+    cf_max_frozen_move_m: float = 0.06       # ... freeze_arm: the frozen TCP stays within this
+    cf_no_grasp_tasks: str = "click_alarmclock,click_bell,press_stapler"  # grasp_miss is meaningless
+    cf_redo_salt: int = 0                    # >0: redo draws a NEW mode / arm / perturbation
     cf_escalation: float = 1.6
     cf_min_prefix_frames: int = 4
     cf_min_suffix_frames: int = 24
@@ -461,9 +472,11 @@ class Generator:
             unit = os.path.dirname(cf_dir)
             k = int(os.path.basename(cf_dir).split("_")[1])
             m = int(os.path.basename(unit).split("_")[-1])
-            seed = int(os.path.basename(os.path.dirname(unit)).split("_")[-1])
             with open(os.path.join(unit, "base_init.json")) as f:
-                orig = json.load(f)["config"]
+                bi = json.load(f)
+            orig = bi["config"]
+            # the sim seed (release runs name episodes by release index, not seed)
+            seed = int(bi.get("seed", os.path.basename(os.path.dirname(unit)).split("_")[-1]))
             # the scene must be the original one (these build self.args at start-up) ...
             clash = [key for key in _REDO_SCENE_KEYS if orig.get(key) != getattr(cfg, key)]
             if clash:
@@ -746,11 +759,17 @@ class Generator:
                     "speed_limit_mps": float(speed_limit),
                     "plausible": bool(peak <= speed_limit)})
         div["diverging_arms"] = [a for a in ("left", "right") if self._arm_diverged(div.get(a, {}))]
+        if cfg.cf_reasonable_gate:
+            clutter = [c["object_type"] for c in
+                       (getattr(self.task, "info", {}) or {}).get("cluttered_table_info") or []]
+            div["unreasonable"] = CF.reasonableness(
+                mode, meta["arms"], meta.get("breakpoint_frame"), expert_tcp, ro.rec.tcp_track(),
+                self._expert_obj, ro.rec.obj_track(), self._obj_names, clutter, self.fps, cfg)
         diverged = (div.get("max_tcp_m", 0) >= cfg.cf_min_tcp_deviation_m
                     or div.get("max_rot_deg", 0) >= cfg.cf_min_rot_deviation_deg
                     or div.get("gripper_mismatch_frac", 0) >= cfg.cf_min_gripper_mismatch_frac
                     or div.get("max_object_m", 0) >= cfg.cf_min_object_deviation_m)
-        return executed, meta, div, bool(diverged and div["plausible"])
+        return executed, meta, div, bool(diverged and div["plausible"] and not div.get("unreasonable"))
 
     def _arm_diverged(self, d):
         cfg = self.cfg
@@ -769,8 +788,11 @@ class Generator:
         from .recorder import write_json
         from .rollout import Rollout
 
-        rng = _unit_rng(cfg, seed, m, f"cf{k}")
-        mode = CF.pick(rng, _parse_probs(cfg.cf_mode_probs))
+        rng = _unit_rng(cfg, seed, m, f"cf{k}" + (f"/redo{cfg.cf_redo_salt}" if cfg.cf_redo_salt else ""))
+        probs = _parse_probs(cfg.cf_mode_probs)
+        if cfg.task in [t.strip() for t in cfg.cf_no_grasp_tasks.split(",") if t.strip()]:
+            probs.pop("grasp_miss", None)   # the expert presses / clicks: nothing to miss
+        mode = CF.pick(rng, probs)
         arm_sel = CF.pick(rng, _parse_probs(cfg.cf_arm_probs))
         if mode in ("freeze_arm", "gripper_flip", "grasp_miss") and arm_sel == "both":
             arm_sel = "left" if rng.random() < 0.5 else "right"
@@ -810,17 +832,21 @@ class Generator:
                              "max_rot_deg": div.get("max_rot_deg"),
                              "gripper_mismatch_frac": div.get("gripper_mismatch_frac"),
                              "plausible": div["plausible"],
-                             "peak_tcp_speed_mps": div["peak_tcp_speed_mps"]})
+                             "peak_tcp_speed_mps": div["peak_tcp_speed_mps"],
+                             "unreasonable": div.get("unreasonable")})
             # an implausible rollout (arm swinging at metres per second) is never kept, not
             # even as the "most divergent" fallback
-            if div["plausible"] and (final is None or ok
-                                     or div.get("max_tcp_m", 0) > final[2].get("max_tcp_m", 0)):
+            # fallback preference: reasonable over unreasonable, then the most divergent
+            rank = lambda d: (not d.get("unreasonable"), d.get("max_tcp_m", 0))
+            if div["plausible"] and (final is None or ok or rank(div) > rank(final[2])):
                 final = res
             if ok:
                 break
         if final is None:
             raise RuntimeError(f"counterfactual {k}: no plausible attempt: {attempts}")
         executed, meta, div, ok = final
+        if cfg.cf_require_reasonable and div.get("unreasonable"):
+            raise RuntimeError(f"counterfactual {k}: no reasonable attempt: {attempts}")
         # ---- render the accepted (or most divergent) executed stream exactly -------------
         self._reset(seed)
         rec = self._recorder(rig)
