@@ -160,6 +160,19 @@ Robocasa lessons applied:
   implausible attempt is never kept, not even as the most divergent fallback.
   `scripted_diverge` also requires a plan for every arm it chose — previously a failed plan
   left a "counterfactual" whose only change was the other arm holding still.
+* **Make sure it is still about the task** (`counterfactual.reasonableness`, added after an
+  audit of all 385k release-run counterfactuals found ~3.8% that were plausible but not
+  credible variations of the task). An attempt is rejected, like a below-gate one, if a
+  perturbed TCP gets > 45 cm from the expert's (or spends most of the clip > 25 cm off while
+  drifting from the objects), the gripper keeps > 20 cm further from every task object than
+  the expert's (noisy / scripted), an object moves > 4 m/s and > 2x the expert's fastest, a
+  distractor moves > 15 cm more than in the expert, or a frozen arm moves > 6 cm (it was hit).
+  Everything is relative to the expert: ur5's own expert moves 8 cm between saved frames and
+  some distractors roll off the table in the expert itself. The fallback prefers reasonable
+  attempts; `--cf_require_reasonable` (used by redos) refuses to keep an unreasonable one.
+  `grasp_miss` is not drawn for tasks whose expert closes its gripper only to press or click
+  (`cf_no_grasp_tasks`: the bell, the alarm clock, the stapler) -- a "missed grasp" there
+  is just a pose offset.
 * **Make sure it acts, for every mode.** `freeze_arm` draws its breakpoint only from frames
   after which the frozen arm's TCP still travels ≥ `freeze_min_remaining_m` (8 cm; else freezing
   is a no-op: late breakpoints, or the idle arm of a one-armed task); with no such frame for
@@ -213,6 +226,10 @@ finger links), `left/right_gripper` (rest of the gripper), `left/right_arm`, `ro
 stapler, a target pad, a dustbin), `art:<name>` (articulated objects), `env:<name>` (table,
 wall, ground only). A fixed task object counts as an object for every interaction number:
 before `fix:` existed, pressing the bell read as robot-environment contact.
+ur5-wsg's finger pads are separate fixed links (`fix_gripper_name`) and are `*_finger`; until
+2026-11-02 they were `*_gripper`, which hid every ur5 grasp from the held windows (5% of ur5
+experts had one, vs ~91% for the other robots). Rollouts recorded before that are repaired
+without simulation: `annotate_contacts.py --rederive --finger_parts finger,gripper`.
 Contacts inside one arm's chain are dropped (joint-internal). Steps are binned into video
 frames exactly like poses, so `contacts.npz` row k is frame k. Repeated actor names (both
 blocks of stack_blocks_two are "box") become `box#0`, `box#1`.
@@ -304,6 +321,13 @@ under `<data root>/_redo_backup/`. Unit-level problems (e.g. a failed wrist moun
 be repaired this way; `scripts/quarantine.py` moves whatever still fails after a redo out of
 the dataset tree (`<data root>/_quarantine/`, reversible), so loaders that walk the tree
 never see it.
+
+A redo re-draws mode, arm and perturbation from the original seeded rng, so it reproduces the
+original unless something changed; `--cf_redo_salt N` (N > 0) draws a new one instead (the
+right choice when the original was valid by the gates of its time but is unwanted now). The
+sim seed comes from `base_init.json` (release runs name episodes by release index, not seed).
+At release scale a redo runs through the work queue: an item with a `redo_list` runs
+`generate.py --redo_list` for its task (`scripts/queue_worker.py`).
 
 ## 10. Scaling to the RoboTwin 2.0 release
 
