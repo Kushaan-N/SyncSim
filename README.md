@@ -26,8 +26,10 @@ two.
   roll, pitch, yaw) is swept out and back in a straight line while everything else holds
   still: 12 legs (2 arms × 6 DoF), each out and back. The exact frame span of every leg is
   recorded.
-* **Counterfactual episodes**, each checked to actually differ from the expert and to stay
-  physically plausible (no end effector faster than 1 m/s):
+* **Counterfactual episodes**, each checked to actually differ from the expert, to stay
+  physically plausible (no end effector faster than 1 m/s), and to remain a credible
+  variation of the task (no wandering off, flung objects, smashed distractors or a "frozen"
+  arm that moves; see DESIGN.md §5):
   * `grasp_miss`: one of the expert's grasps approached a few cm off (sideways or above),
     so the fingers close beside the object or catch it off-centre;
   * `noisy_replay`: small, smooth end-effector offsets (capped at 6 cm) on the left, right,
