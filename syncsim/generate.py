@@ -507,9 +507,20 @@ class Generator:
                              json.load(open(cpath)) if os.path.exists(cpath) else None)
             backup = os.path.join(backup_root, os.path.relpath(cf_dir, set_dir))
             os.makedirs(os.path.dirname(backup), exist_ok=True)
-            if os.path.exists(backup):
+            # a backup left behind means an earlier redo died between moving the original
+            # aside and finishing: the backup is the original, anything at cf_dir is partial
+            if os.path.isdir(backup) and os.listdir(backup):
+                shutil.rmtree(cf_dir, ignore_errors=True)
+                shutil.move(backup, cf_dir)
+                print(f"[redo] {cf_dir}: original recovered from a leftover backup")
+            elif os.path.exists(backup):
                 shutil.rmtree(backup)
-            shutil.move(cf_dir, backup)
+            if os.path.exists(cf_dir):
+                shutil.move(cf_dir, backup)
+            else:
+                # the original is gone (lost before this fix); regenerate it from scratch
+                print(f"[redo] {cf_dir}: no original on disk, generating it fresh")
+                backup = None
             try:
                 # set the seeded scene up first: the speed limit reads the physics timestep
                 # (`self.fps`) before the first probe resets the task
@@ -527,8 +538,11 @@ class Generator:
             except Exception:
                 traceback.print_exc()
                 shutil.rmtree(cf_dir, ignore_errors=True)
-                shutil.move(backup, cf_dir)
-                print(f"[redo] FAILED {cf_dir}: original restored")
+                if backup:
+                    shutil.move(backup, cf_dir)
+                    print(f"[redo] FAILED {cf_dir}: original restored")
+                else:
+                    print(f"[redo] FAILED {cf_dir}: no original to restore")
             finally:
                 self.rt.close_task(self.task, clear_cache=True)
         print(f"[redo] {cfg.task}: regenerated {n_ok}/{len(todo)}")
