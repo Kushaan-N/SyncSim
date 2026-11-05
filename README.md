@@ -1,236 +1,127 @@
 # SyncSim
 
-## About
+SyncSim is a data generator for **action-conditioned world models of two-armed robots**: models
+that, given what a robot sees and the actions it is about to take, predict what it will see
+next. It runs on the [RoboTwin 2.0](https://github.com/RoboTwin-Platform/RoboTwin) simulator
+and turns each scripted task demonstration into an episode that shows not only the task done
+right, but also many physically plausible ways it can go differently.
 
-SyncSim generates training data for **action-conditioned world models of bimanual (two-arm)
-robots**. It runs on the [RoboTwin 2.0](https://github.com/RoboTwin-Platform/RoboTwin)
-simulator and turns each scripted demonstration into a small, multi-view episode bundle:
+The data follows the visual-calibration recipe of SyncWorld (a world model that watches a short
+calibration clip to learn how actions map to pixels in a new camera setup), extended from one
+arm to two.
 
-* the **expert** demonstration,
-* a **visual calibration** clip that shows how each arm's actions move it on screen, and
-* **counterfactual** rollouts: the same scene with different actions,
+## The dataset
 
-each filmed by several randomized third-person cameras and a camera on each wrist. The data
-follows the visual-calibration recipe of SyncWorld (a world model that reads a short
-calibration clip to learn how actions map to pixels in a new setup), extended from one arm to
-two.
-
-## Dataset
-
-The full run over the RoboTwin 2.0 release is on the Hugging Face Hub as
+The full run over the RoboTwin 2.0 release is published on the Hugging Face Hub as
 [`ohthatjeff/syncsim-rt2`](https://huggingface.co/datasets/ohthatjeff/syncsim-rt2):
-96,402 episodes (50 tasks; aloha-agilex, arx-x5, franka and ur5; clean and domain-randomized
-scenes), each with an expert, a calibration sweep and four counterfactuals, filmed by two
-third-person and two wrist cameras, with contacts and masks (~2 TB). Episodes are packed into
-tar shards of up to 2 GB; `episodes.parquet` indexes every episode (robot, task, seed, expert
-success, counterfactual modes and outcomes, shard), so you can download just the shards you
-need. The dataset card describes the layout and how to read it.
 
-## What it generates
+* **96,402 episodes**, ~2 TB
+* **50 tasks**: handing objects between arms, stacking blocks and bowls, placing objects in
+  baskets or on stands, hanging a mug, opening a laptop or microwave, pressing a stapler or
+  bell, ...
+* **4 robots**: aloha-agilex, arx-x5, franka and ur5
+* **Two scene styles**: clean tables, and domain-randomized ones (textures, lighting, clutter)
+* **Per episode**: one expert demonstration, one calibration clip and four counterfactuals,
+  each filmed by four cameras, with contact and segmentation labels
 
-* **Randomized cameras.** Each episode gets N simultaneous third-person cameras sampled around
-  both grippers, at varied azimuth, elevation and distance, and at least 45° apart. A view is
-  kept only if both hands stay visible at several points of the episode, checked with
-  segmentation so occlusion counts. Each wrist camera gets a slightly jittered mount, kept
-  only if its own gripper stays in frame and its ray-traced view is clean.
-* **Bimanual visual calibration.** Every end-effector degree of freedom of each arm (x, y, z,
-  roll, pitch, yaw) is swept out and back in a straight line while everything else holds
-  still: 12 legs (2 arms × 6 DoF), each out and back. The exact frame span of every leg is
-  recorded.
-* **Counterfactual episodes**, each checked to actually differ from the expert, to stay
-  physically plausible (no end effector faster than 1 m/s), and to remain a credible
-  variation of the task (no wandering off, flung objects, smashed distractors or a "frozen"
-  arm that moves; see DESIGN.md §5):
-  * `grasp_miss`: one of the expert's grasps approached a few cm off (sideways or above),
-    so the fingers close beside the object or catch it off-centre;
-  * `noisy_replay`: small, smooth end-effector offsets (capped at 6 cm) on the left, right,
-    or both arms -- an imprecise arm, not a wandering one;
-  * `scripted_diverge`: the expert up to a breakpoint, then scripted end-effector motions;
-  * `freeze_arm`: one arm stops, at a point where it still had somewhere to go, while the
-    other continues, which breaks the two arms' coordination;
-  * `gripper_flip`: one gripper opens or closes when it shouldn't.
-* **Contact ground truth**, per frame: which robot part (each gripper's fingers and body, each
-  arm, the base) touches which object, the table or the other arm, with force and contact
-  point; plus contact windows, grasp / hold windows, collisions the rollout caused, and how
-  far each touched object moved.
-* **Object masks**, per frame and per camera: a lossless label video next to each RGB video
-  whose pixel values name the part shown (each arm's fingers, gripper and links, every object,
-  the table), with the same part names as the contacts. Counterfactual edit points are drawn near the expert's
-  grasps and contacts (`cf_focus_prob`), so most of them change what happens to an object.
-* **Any two-arm embodiment RoboTwin supports**, including mixed pairs (e.g. a Piper left arm
-  and a Franka right arm).
+The dataset card explains the file layout and how to download only the parts you need.
 
-Every rollout is a replay of a recorded per-physics-step control stream from the same seeded
-scene, so expert and counterfactuals are directly comparable, and any rollout can be
-re-rendered from new viewpoints. Design rationale: [`DESIGN.md`](DESIGN.md).
+## What an episode contains
 
-## Requirements
+### The expert
 
-* RoboTwin 2.0 with its assets, set up per its instructions; point `ROBOTWIN_ROOT` at it.
-* Its Python environment, plus `imageio-ffmpeg`.
-* An NVIDIA GPU with ray-tracing support for the default `rt` shader (`--shader default`
-  uses the rasterizer instead).
+The task performed successfully by RoboTwin's scripted planner. For the published dataset these
+are the expert trajectories of the RoboTwin 2.0 release, replayed in the same seeded scenes.
 
-## Usage
+### A calibration clip
 
-One task, a few seeds:
+Each arm's end effector moves out and back along each of its six degrees of freedom (x, y, z,
+roll, pitch, yaw) while everything else holds still: 12 short motions in total, with the exact
+frames of each one recorded. A model can watch this clip to learn how actions show up on screen
+from these particular cameras, before it has to predict anything.
+
+### Counterfactuals
+
+Rollouts in the same scene where the actions are deliberately changed part-way through, so the
+outcome differs from the expert. There are five kinds:
+
+| Kind | What changes |
+|---|---|
+| **grasp miss** | one grasp approaches a few centimetres off, so the fingers close beside the object or catch it off-centre |
+| **noisy replay** | small, smooth offsets on one or both arms: an imprecise arm, not a wandering one |
+| **scripted diverge** | the expert up to a point, then different scripted motions |
+| **freeze arm** | one arm stops while it still had work to do, and the other carries on |
+| **gripper flip** | a gripper opens or closes when it shouldn't |
+
+A counterfactual is kept only if it really differs from the expert, stays physically plausible
+(no end effector faster than 1 m/s), and remains a believable variation of the task: no arm
+wandering off, no flung objects, no smashed distractors. Most perturbations are placed near the
+expert's grasps and contacts, so they change what happens to an object rather than just moving
+an arm through empty space. Some counterfactuals still complete the task, many don't, and every
+one records whether it succeeded.
+
+### Cameras
+
+Every rollout is filmed by four cameras at 512×512 and ~21 fps:
+
+* **two third-person cameras**, placed at random around the robot for each episode (varied
+  angle, height and distance, at least 45° apart), and kept only if both hands stay visible
+  throughout;
+* **one camera on each wrist**, with a slightly jittered mount.
+
+The expert, calibration and counterfactuals of an episode share the same cameras, so they can
+be compared frame by frame.
+
+### Labels
+
+Besides video, every rollout comes with:
+
+* **actions and robot state**: both arms' end-effector poses, gripper openings and joint
+  positions, frame by frame;
+* **object poses** for every movable object, frame by frame;
+* **contacts**: which robot part (fingers, gripper, arm, base) touches which object, the table
+  or the other arm, with force; plus when each object was grasped, held and released;
+* **segmentation masks**: a lossless video next to each camera's video, whose pixel values name
+  what is visible (each arm's parts, every object, the table), using the same names as the
+  contacts.
+
+Together these make it possible to pick out specific events, e.g. every grasp that slipped, or
+every collision between an arm and an object.
+
+## How it works
+
+Every rollout (expert, calibration, counterfactual) is a replay of a recorded, physics-step
+by physics-step control stream from the same seeded starting scene. The simulator is
+deterministic, so the expert and its counterfactuals differ only where their actions differ,
+and any rollout can be re-rendered later from new viewpoints. Counterfactuals are first tried
+out without rendering, and only the ones that pass the checks above are rendered.
+
+The reasoning behind these choices is in [`DESIGN.md`](DESIGN.md).
+
+## Running it
+
+Requirements: RoboTwin 2.0 with its assets (point `ROBOTWIN_ROOT` at it), its Python
+environment plus `imageio-ffmpeg`, and an NVIDIA GPU with ray tracing (or `--shader default`
+for the rasterizer).
 
 ```bash
 export ROBOTWIN_ROOT=/path/to/RoboTwin
-python -m syncsim.generate --task handover_block --seed_start 0 --num_seeds 5 \
-    --output_dir data/set_0
-python -m syncsim.generate --help          # every option
+python -m syncsim.generate --task handover_block --seed_start 0 --num_seeds 5 --output_dir data/set_0
+python -m syncsim.generate --help     # every option
 ```
 
-Many tasks for one seed shard ("set"). `scripts/gen_set.sh` holds all generation defaults as
-environment variables:
+Larger runs go through the scripts in `scripts/`: SLURM submission, a shared work queue for
+replaying the whole RoboTwin release, offline validation, regeneration of bad counterfactuals,
+and adding contact or mask labels to existing data. Each script documents its usage at the top.
 
-```bash
-SET_ID=0 TASKS="handover_block lift_pot" ./scripts/gen_set.sh
-SET_ID=0 PRINT_CONFIG=1 ./scripts/gen_set.sh                         # show the resolved config
-SET_ID=0 EMBODIMENT="piper,franka-panda,0.6" ./scripts/gen_set.sh    # two different arms
-```
-
-The full task suite on a SLURM cluster, as an array of (set × task group) jobs:
-
-```bash
-DRY_RUN=1 NUM_SETS=2 PARTITION=<partition> ACCOUNT=<account> ./scripts/submit_slurm.sh
-NUM_SETS=2 PARTITION=<partition> ACCOUNT=<account> ./scripts/submit_slurm.sh
-```
-
-Runs resume where they stopped: finished units are marked `_DONE`, and seeds that were
-dropped (expert failure, unstable scene, camera gate, or an error) are remembered in
-`<task>/_dropped.json`.
-
-Check a generated set without the simulator (file structure, frame counts, counterfactual
-divergence per mode, task success rates; `--montage_dir` saves frame grids of every view):
-
-```bash
-python scripts/verify_set.py --set_dir data/set_0 --montage_dir montage/
-```
-
-To repair a set, list every bad rollout (`--dark_scan` also decodes every wrist video to
-catch views that go dark mid-episode), then regenerate the listed counterfactuals in place
-on a GPU node (the originals are backed up under `<data>/_redo_backup/`). A redo that is
-killed part-way can simply be re-run: a backup left behind is restored before that
-counterfactual is regenerated, and one with no original on disk is generated fresh. Validate again,
-and move whatever still fails (e.g. a unit whose wrist mount failed, which a redo cannot fix)
-out of the dataset tree into `<data>/_quarantine/`; `--restore` moves it back.
-
-```bash
-python scripts/verify_set.py --set_dir data/set_0 --dark_scan --exclude_out bad.tsv
-LIST=bad.tsv DRY_RUN=1 bash scripts/redo_cf.sh      # show what would be regenerated
-LIST=bad.tsv bash scripts/redo_cf.sh
-python scripts/verify_set.py --set_dir data/set_0 --dark_scan --exclude_out still_bad.tsv
-python scripts/quarantine.py --list still_bad.tsv
-```
-
-While a run is in progress, validate each task as soon as it finishes (verdicts go to
-`<data>/_validate.log`), and summarise a whole data root (yield per task, camera spread,
-calibration coverage, counterfactual divergence and success rates):
-
-```bash
-DATA_ROOT=data nohup bash scripts/watch_validate.sh &
-python scripts/dataset_stats.py --root data --json_out stats.json
-```
-
-Add contact labels to a data root generated without them (an unrendered replay of every
-rollout's saved control stream; checked against the stored object poses, videos untouched),
-then build the interaction index and the distribution numbers per counterfactual mode:
-
-```bash
-DATA_ROOT=data N_SHARDS=48 bash scripts/submit_contacts.sh
-python scripts/contact_stats.py --data_root data --by_task
-python scripts/contact_stats.py --data_root data_v2 --compare data/contact_index.jsonl
-```
-
-Masks are added the same way (a replay plus a rasterised segmentation render per frame):
-
-```bash
-DATA_ROOT=data N_SHARDS=48 bash scripts/submit_masks.sh
-```
-
-`contact_index.jsonl` (one row per rollout) and `contact_events.jsonl` (one row per contact
-window) are the tables to sample training data from, e.g. every rollout with an arm-object
-collision, or every grasp that ended with the object dropped.
-
-### The RoboTwin 2.0 release as experts (large-scale runs)
-
-Instead of planning its own experts, SyncSim can replay the ~110k expert demonstrations of the
-[RoboTwin 2.0 dataset](https://huggingface.co/datasets/TianxingChen/RoboTwin2.0) (50 tasks;
-aloha-agilex, arx-x5, franka and ur5; 50 clean + 500 domain-randomized episodes each) and add
-its cameras, calibration, counterfactuals, contacts and masks to every one of them. Only the
-seeds, scene info, planner trajectories and instructions are fetched (~10 GB, read straight
-out of the remote zips), never the release's HDF5s:
-
-```bash
-python scripts/fetch_robotwin_release.py --out <release_root> --workers 24
-python -m syncsim.generate --task lift_pot --release_dir <release_root>/lift_pot/franka_clean_50 \
-    --output_dir data_rt2/franka_clean_50 --seed_start 0 --num_seeds 5    # release episodes 0-4
-```
-
-`--seed_start / --num_seeds` then index the release's episodes; the embodiment and task
-config come from the directory name. Each episode gets `release.json` (seed, provenance, and
-whether our replay rebuilt the release's scene exactly) and the release's `instructions.json`.
-
-For the whole release, a shared work queue keeps every GPU busy across any number of SLURM
-jobs (claims are atomic, stale claims are taken over, the generator resumes from `_DONE`), so
-jobs can be preempted, cancelled or added at any time:
-
-```bash
-python scripts/queue_worker.py build --queue <q> --release_root <release_root> --output_root data_rt2 --variants clean_50
-python scripts/queue_worker.py build --queue <q> --release_root <release_root> --output_root data_rt2 --variants randomized_500
-QUEUE=<q> WORKERS_PER_GPU=4 sbatch -p <partition> -A <account> --gres gpu:2 -c 32 --mem 240G \
-    --array 0-15 --export ALL scripts/queue.sbatch
-python scripts/queue_worker.py status --queue <q>
-```
-
-Workers use the run defaults of `scripts/gen_set.sh`, re-read before every item.
-
-## Output
-
-```
-set_<id>/<task>/episode_<seed>/camera_poses_<m>/
-    views.json            camera rig: per-view pose, azimuth / elevation / distance, visibility
-                          check results; wrist mounts
-    base_init.json        seed, embodiment, scene randomization, action layout, full config
-    expert_stream.npz     the expert's control stream (replayable)
-    calibration/          + move_range.json: per leg arm, DoF, sign, amount, frame spans,
-                            measured motion
-    expert/               + metadata.json
-    counterfactual_<k>/   + metadata.json: mode, arms, breakpoint, divergence from the expert
-                            (overall and per arm), whether the task still succeeded
-
-each rollout directory:
-    agentview_rgb/video.mp4, agentview_rgb_1/video.mp4    third-person views
-    wrist_left_rgb/video.mp4, wrist_right_rgb/video.mp4   wrist views
-    pose.pkl       per arm: gripper pose [T,7] (xyz + quat xyzw), 4x4 matrix, gripper opening
-    actions.npy    [T,16]: per arm gripper-centre xyz, quat xyzw, opening (left 0:8, right 8:16)
-    joints.npy     measured joint positions of both arms
-    object_poses.npz   world pose of every movable object per frame
-    contacts.npz   per frame x part pair (gripper fingers / body, arm, base, objects, fixed
-                   task objects, table): touching share of the frame, impulse, contact point
-    contacts.json  contact windows (frame x to y, force, object motion during / after),
-                   held windows per arm, and a summary (interaction share, event counts)
-    <view>/mask.mkv  per-pixel part ids, frame for frame with <view>/video.mp4 (lossless FFV1;
-                   read with syncsim.masks.read_mask_video)
-    masks.json     pixel value -> part name, and the parts each view shows
-```
-
-Defaults: 512×512 video at ~20.8 fps (physics at 250 Hz, a frame every 12 steps), two
-third-person views, four counterfactuals per episode. Release runs (`--release_dir`) add
-`instructions.json` and `release.json` at the episode level. In the published dataset, the
-absolute paths stored in the JSON files are replaced with placeholders such as `<data_root>`.
-
-## Repository layout
-
-| path | contents |
+| Path | Contents |
 |---|---|
 | `syncsim/generate.py` | per-task generator and its configuration |
 | `syncsim/rt_env.py` | RoboTwin bridge; control-stream recording and replay |
 | `syncsim/cameras.py` | camera sampling, visibility check, wrist-mount jitter |
 | `syncsim/calibration.py` | bimanual calibration sweep |
-| `syncsim/counterfactual.py` | counterfactual modes and divergence measurement |
+| `syncsim/counterfactual.py` | counterfactual kinds and divergence measurement |
+| `syncsim/contacts.py`, `syncsim/masks.py` | contact and segmentation labels |
 | `syncsim/motion.py` | straight-line end-effector motion planning |
 | `syncsim/recorder.py`, `syncsim/rollout.py` | rendering, file output, stepping |
-| `scripts/` | batch generation, SLURM submission, offline verification and statistics |
+| `scripts/` | batch generation, SLURM, validation, repair and statistics |
