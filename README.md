@@ -62,7 +62,7 @@ one records whether it succeeded.
 
 ### Cameras
 
-Every rollout is filmed by four cameras at 512×512 and ~21 fps:
+Every rollout is filmed by four cameras at ~21 fps (384×384 in the published dataset; the resolution is a setting):
 
 * **two third-person cameras**, placed at random around the robot for each episode (varied
   angle, height and distance, at least 45° apart), and kept only if both hands stay visible
