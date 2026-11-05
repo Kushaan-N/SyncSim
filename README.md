@@ -15,6 +15,17 @@ follows the visual-calibration recipe of SyncWorld (a world model that reads a s
 calibration clip to learn how actions map to pixels in a new setup), extended from one arm to
 two.
 
+## Dataset
+
+The full run over the RoboTwin 2.0 release is on the Hugging Face Hub as
+[`ohthatjeff/syncsim-rt2`](https://huggingface.co/datasets/ohthatjeff/syncsim-rt2):
+96,402 episodes (50 tasks; aloha-agilex, arx-x5, franka and ur5; clean and domain-randomized
+scenes), each with an expert, a calibration sweep and four counterfactuals, filmed by two
+third-person and two wrist cameras, with contacts and masks (~2 TB). Episodes are packed into
+tar shards of up to 2 GB; `episodes.parquet` indexes every episode (robot, task, seed, expert
+success, counterfactual modes and outcomes, shard), so you can download just the shards you
+need. The dataset card describes the layout and how to read it.
+
 ## What it generates
 
 * **Randomized cameras.** Each episode gets N simultaneous third-person cameras sampled around
@@ -100,7 +111,9 @@ python scripts/verify_set.py --set_dir data/set_0 --montage_dir montage/
 
 To repair a set, list every bad rollout (`--dark_scan` also decodes every wrist video to
 catch views that go dark mid-episode), then regenerate the listed counterfactuals in place
-on a GPU node (the originals are backed up under `<data>/_redo_backup/`). Validate again,
+on a GPU node (the originals are backed up under `<data>/_redo_backup/`). A redo that is
+killed part-way can simply be re-run: a backup left behind is restored before that
+counterfactual is regenerated, and one with no original on disk is generated fresh. Validate again,
 and move whatever still fails (e.g. a unit whose wrist mount failed, which a redo cannot fix)
 out of the dataset tree into `<data>/_quarantine/`; `--restore` moves it back.
 
@@ -205,7 +218,9 @@ each rollout directory:
 ```
 
 Defaults: 512×512 video at ~20.8 fps (physics at 250 Hz, a frame every 12 steps), two
-third-person views, four counterfactuals per episode.
+third-person views, four counterfactuals per episode. Release runs (`--release_dir`) add
+`instructions.json` and `release.json` at the episode level. In the published dataset, the
+absolute paths stored in the JSON files are replaced with placeholders such as `<data_root>`.
 
 ## Repository layout
 
