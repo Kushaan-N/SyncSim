@@ -8,6 +8,9 @@ to a two-arm tabletop:
   motion is preferred) -- azimuth around the embodiment's own head-camera direction,
   an explicit ELEVATION band, a true 3D radius -- and re-aimed at the target with a small
   aim/roll jitter.
+* `--camera_mode head` replaces the sphere with an egocentric, humanoid-head placement:
+  laterally between the two shoulders, set back from / above the shoulder line by a random
+  amount, looking forward and down at a random pitch (`sample_head_candidates`).
 * Candidates that are physically impossible are rejected before any rendering: inside the
   back wall, under the table top, under the floor.
 * The GATE is occlusion-aware: a small segmentation camera counts each gripper's link pixels
@@ -241,6 +244,59 @@ def rt_view_ok(raster_gray, rt_gray, min_std, min_corr):
     return c >= min_corr, sd, c
 
 
+def arm_base_positions(robot):
+    """World positions of each arm's first (shoulder) joint at the current scene state."""
+    return tuple(np.asarray(getattr(robot, f"{a}_arm_joints")[0].get_global_pose().p, float)
+                 for a in ("left", "right"))
+
+
+def sample_head_candidates(rng, shoulders, target, n, cfg, table_xy=(0.0, 0.0)):
+    """n egocentric 'head' camera poses, the way a humanoid sees its own hands: the camera
+    sits laterally BETWEEN the two shoulders (a random fraction of the half-span either side
+    of their midpoint), some distance behind or in front of the shoulder line, at a random
+    height above the table, and looks forward (towards the workspace, with a small yaw
+    jitter) and down at a random pitch. Height, set-back and pitch play the part of
+    different humanoids' builds; the lateral constraint is what keeps the view between the
+    arms."""
+    L, R = shoulders
+    mid = (L + R) / 2
+    lat = (R - L)[:2]
+    w = float(np.linalg.norm(lat))
+    u = lat / (w + 1e-9)                                   # left -> right shoulder, horizontal
+    f = np.array([-u[1], u[0]])                            # horizontal, perpendicular to u ...
+    if np.dot(f, np.asarray(target)[:2] - mid[:2]) < 0:   # ... pointing at the workspace
+        f = -f
+    out, tries = [], 0
+    while len(out) < n and tries < n * 20:
+        tries += 1
+        s = rng.uniform(-cfg.head_lateral_frac, cfg.head_lateral_frac)
+        back = rng.uniform(*cfg.head_back_m)
+        h = rng.uniform(*cfg.head_height_m)
+        xy = mid[:2] + s * (w / 2) * u + back * f
+        p = np.array([xy[0], xy[1], TABLE_TOP_Z + h])
+        if not physically_ok(p, table_xy):
+            continue
+        yaw = math.radians(rng.uniform(-cfg.head_yaw_deg, cfg.head_yaw_deg))
+        pitch = math.radians(rng.uniform(*cfg.head_pitch_deg))
+        fy = np.array([f[0] * math.cos(yaw) - f[1] * math.sin(yaw),
+                       f[0] * math.sin(yaw) + f[1] * math.cos(yaw)])
+        fwd = np.array([fy[0] * math.cos(pitch), fy[1] * math.cos(pitch), -math.sin(pitch)])
+        roll = rng.uniform(-cfg.roll_jitter_deg, cfg.roll_jitter_deg)
+        # orbit-style parameters relative to the aim target, for comparability with orbit rigs
+        d = p - np.asarray(target)
+        r = float(np.linalg.norm(d))
+        out.append({"mat": look_at_mat(p, p + fwd, roll), "pos": p,
+                    "aim": p + fwd * r,
+                    "azimuth_deg": math.degrees(math.atan2(d[1], d[0])),
+                    "elevation_deg": math.degrees(math.asin(d[2] / (r + 1e-9))),
+                    "radius_m": r, "roll_deg": roll,
+                    "head": {"lateral_frac": s, "lateral_m": s * w / 2, "shoulder_span_m": w,
+                             "setback_m": -back, "height_above_table_m": h,
+                             "pitch_down_deg": math.degrees(pitch),
+                             "yaw_deg": math.degrees(yaw)}})
+    return out
+
+
 def gate_and_select(task, reset_fn, stream, cfg, rng, args, n_views, frame_stride):
     """`reset_fn()` must put `task` back at the seeded initial scene (it is called twice:
     once for the aim-target pass, once for the gate pass).
@@ -281,7 +337,12 @@ def gate_and_select(task, reset_fn, stream, cfg, rng, args, n_views, frame_strid
         ref = np.array([0.0, -1.0])
     ref = ref / (np.linalg.norm(ref) + 1e-9)
     table_xy = tuple(getattr(task, "table_xy_bias", (0.0, 0.0)))
-    cands = sample_candidates(rng, target, ref, cfg.num_candidates, cfg, table_xy)
+    if getattr(cfg, "camera_mode", "orbit") == "head":
+        # the first joint's frame hangs off the fixed base, so any scene state will do
+        cands = sample_head_candidates(rng, arm_base_positions(robot), target,
+                                       cfg.num_candidates, cfg, table_xy)
+    else:
+        cands = sample_candidates(rng, target, ref, cfg.num_candidates, cfg, table_xy)
     wrist_cands = {a: sample_wrist_jitters(rng, cfg.wrist_candidates, cfg.wrist_pos_jitter,
                                            cfg.wrist_rot_jitter_deg) for a in ("left", "right")}
 
