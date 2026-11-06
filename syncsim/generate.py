@@ -76,6 +76,15 @@ class Config:
     roll_jitter_deg: float = 4.0
     min_separation_deg: float = 45.0         # min baseline angle between simultaneous views
     num_candidates: int = 96
+    # camera_mode "orbit": the sphere above (azimuth / elevation / radius around the target);
+    # "head": egocentric, like a humanoid's head -- laterally between the two shoulders, then
+    # set back, raised and pitched down by random amounts (cameras.sample_head_candidates)
+    camera_mode: str = "orbit"
+    head_lateral_frac: float = 0.5           # +- this fraction of the half shoulder span
+    head_back_m: tuple = (-0.30, 0.05)       # along the forward axis from the shoulder line
+    head_height_m: tuple = (0.40, 0.80)      # above the table top (stock head camera: 0.61)
+    head_pitch_deg: tuple = (35.0, 70.0)     # looking down (stock head camera: 53)
+    head_yaw_deg: float = 12.0               # +- around straight ahead
     check_frames: int = 4                    # gripper visibility checked at this many frames
     gate_arms: str = "both"                  # both | active | any
     min_gripper_px_frac: float = 0.0015      # of the gate image (~400 px at 512^2)
@@ -294,12 +303,14 @@ def _rig_json(rig, cfg):
         "gate_size": rig["gate_size"], "candidates": rig["candidates"],
         "candidates_passed": rig["alive"],
         "min_separation_deg": cfg.min_separation_deg,
+        "camera_mode": getattr(cfg, "camera_mode", "orbit"),
         "views": [{
             "index": v_i, "dir": "agentview_rgb" if v_i == 0 else f"agentview_rgb_{v_i}",
             "cam2world_sapien": v["mat"], "position": v["pos"], "aim": v["aim"],
             "azimuth_deg": v["azimuth_deg"], "elevation_deg": v["elevation_deg"],
             "radius_m": v["radius_m"], "roll_deg": v["roll_deg"],
             "gate_gripper_px": v["gripper_px"],
+            **({"head": v["head"]} if "head" in v else {}),
         } for v_i, v in enumerate(rig["views"])],
         "wrist": {a: {"dir": f"wrist_{a}_rgb", "link": f"{a}_camera",
                       "rel_mat": w["rel_mat"], "stock_mount": w["stock"],
