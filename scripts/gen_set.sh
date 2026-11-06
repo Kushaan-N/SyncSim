@@ -58,6 +58,12 @@ REPO="$(cd "${SCRIPT_DIR}/.." && pwd)"
 : "${RADIUS_MAX:=1.35}"
 : "${MIN_SEPARATION_DEG:=45}"
 : "${NUM_CANDIDATES:=96}"
+: "${CAMERA_MODE:=orbit}"           # orbit | head (humanoid-style: between the shoulders, pitched down)
+: "${HEAD_LATERAL_FRAC:=0.5}"
+: "${HEAD_BACK_M:=-0.30,0.05}"
+: "${HEAD_HEIGHT_M:=0.40,0.80}"
+: "${HEAD_PITCH_DEG:=35,70}"
+: "${HEAD_YAW_DEG:=12}"
 : "${CHECK_FRAMES:=4}"
 : "${GATE_ARMS:=both}"               # both | active | any
 # wrist mounts
@@ -104,6 +110,9 @@ build_args() {
     --elev_min_deg "${ELEV_MIN_DEG}" --elev_max_deg "${ELEV_MAX_DEG}"
     --radius_min "${RADIUS_MIN}" --radius_max "${RADIUS_MAX}"
     --min_separation_deg "${MIN_SEPARATION_DEG}" --num_candidates "${NUM_CANDIDATES}"
+    --camera_mode "${CAMERA_MODE}" --head_lateral_frac "${HEAD_LATERAL_FRAC}"
+    "--head_back_m=${HEAD_BACK_M}" "--head_height_m=${HEAD_HEIGHT_M}"
+    "--head_pitch_deg=${HEAD_PITCH_DEG}" --head_yaw_deg "${HEAD_YAW_DEG}"
     --check_frames "${CHECK_FRAMES}" --gate_arms "${GATE_ARMS}"
     --wrist_pos_jitter "${WRIST_POS_JITTER}" --wrist_rot_jitter_deg "${WRIST_ROT_JITTER_DEG}"
     --record_calibration "${RECORD_CALIBRATION}" --calib_trans_m "${CALIB_TRANS_M}"
