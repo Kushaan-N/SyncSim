@@ -81,10 +81,15 @@ class Config:
     # set back, raised and pitched down by random amounts (cameras.sample_head_candidates)
     camera_mode: str = "orbit"
     head_lateral_frac: float = 0.5           # +- this fraction of the half shoulder span
-    head_back_m: tuple = (-0.30, 0.05)       # along the forward axis from the shoulder line
-    head_height_m: tuple = (0.40, 0.80)      # above the table top (stock head camera: 0.61)
-    head_pitch_deg: tuple = (35.0, 70.0)     # looking down (stock head camera: 53)
+    head_back_m: tuple = (-0.40, 0.20)       # along the forward axis from the shoulder line
+    head_height_m: tuple = (0.45, 0.95)      # above the table top (stock head camera: 0.61)
+    head_pitch_deg: tuple = (30.0, 65.0)     # looking down (stock head camera: 53)
     head_yaw_deg: float = 12.0               # +- around straight ahead
+    head_max_body_frac: float = 0.05         # reject views where the robot's base/mast covers more
+    head_pool: int = 768                     # head candidates screened on the initial scene
+    head_fovy_deg: float = 70.0              # head cameras are wide-angle (replaces fovy_deg)
+    head_check_frames: int = 24              # close-up head views: check visibility more often
+    head_gate_candidates: int = 192          # screened head views that go on to the full gate
     check_frames: int = 4                    # gripper visibility checked at this many frames
     gate_arms: str = "both"                  # both | active | any
     min_gripper_px_frac: float = 0.0015      # of the gate image (~400 px at 512^2)
@@ -949,6 +954,10 @@ class _TrackOnly:
 
 def main(argv=None):
     cfg = Config(**vars(build_parser().parse_args(argv)))
+    if cfg.camera_mode == "head":
+        # the hands sit out at the sides of a head between the shoulders: a wide lens sees them
+        cfg = dataclasses.replace(cfg, fovy_deg=cfg.head_fovy_deg,
+                                  check_frames=max(cfg.check_frames, cfg.head_check_frames))
     gen = Generator(cfg)
     gen.redo() if cfg.redo_list else gen.run()
 
