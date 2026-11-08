@@ -115,6 +115,13 @@ def gripper_link_ids(robot):
     return out
 
 
+def body_link_ids(robot):
+    """per_scene_ids of the robot's non-arm links (base, torso, mast): exactly what the
+    contact / mask labels call robot_base, so the gate and the masks agree."""
+    from .contacts import robot_part_map
+    return {eid for eid, part in robot_part_map(robot).items() if part == "robot_base"}
+
+
 def tcp_positions(robot):
     l = np.asarray(robot.get_left_tcp_pose()[:3])
     r = np.asarray(robot.get_right_tcp_pose()[:3])
@@ -211,8 +218,8 @@ def add_camera(scene, name, width, height, fovy_deg, shader="default", near=0.05
 class SegCam:
     """A small rasterized segmentation camera that can be moved anywhere."""
 
-    def __init__(self, scene, size, fovy_deg, name="syncsim_gate_cam"):
-        self.cam = add_camera(scene, name, size, size, fovy_deg, shader="default")
+    def __init__(self, scene, size, fovy_deg, name="syncsim_gate_cam", near=0.05):
+        self.cam = add_camera(scene, name, size, size, fovy_deg, shader="default", near=near)
         self.size = size
 
     def seg(self, scene, mat):
@@ -339,8 +346,10 @@ def gate_and_select(task, reset_fn, stream, cfg, rng, args, n_views, frame_strid
     table_xy = tuple(getattr(task, "table_xy_bias", (0.0, 0.0)))
     if getattr(cfg, "camera_mode", "orbit") == "head":
         # the first joint's frame hangs off the fixed base, so any scene state will do
+        # a larger pool, screened on the initial scene below (robots differ a lot in where
+        # their hands rest and what of their own frame a head camera sees)
         cands = sample_head_candidates(rng, arm_base_positions(robot), target,
-                                       cfg.num_candidates, cfg, table_xy)
+                                       cfg.head_pool, cfg, table_xy)
     else:
         cands = sample_candidates(rng, target, ref, cfg.num_candidates, cfg, table_xy)
     wrist_cands = {a: sample_wrist_jitters(rng, cfg.wrist_candidates, cfg.wrist_pos_jitter,
@@ -348,11 +357,31 @@ def gate_and_select(task, reset_fn, stream, cfg, rng, args, n_views, frame_strid
 
     # ---- pass 2: replay again from the initial scene, render every live candidate ----
     reset_fn()
-    segcam = SegCam(task.scene, cfg.gate_size, cfg.fovy_deg)
+    head_mode = getattr(cfg, "camera_mode", "orbit") == "head"
+    # the ray tracer does not clip near geometry, the rasteriser does: a head camera tucked
+    # against the robot's mast must see it in the gate too (same near plane as the masks)
+    from .masks import MASK_NEAR_M
+    segcam = SegCam(task.scene, cfg.gate_size, cfg.fovy_deg,
+                    near=MASK_NEAR_M if head_mode else 0.05)
     wseg = SegCam(task.scene, cfg.gate_size, cfg.wrist_fovy_deg, name="syncsim_gate_wrist")
     wrt = add_camera(task.scene, "syncsim_gate_wrist_rt", cfg.gate_size, cfg.gate_size,
                      cfg.wrist_fovy_deg, shader="rt") if cfg.wrist_rt_check else None
     px_min = cfg.min_gripper_px_frac * cfg.gate_size * cfg.gate_size
+    body_ids = (list(body_link_ids(robot))
+                if getattr(cfg, "camera_mode", "orbit") == "head" else [])
+    if body_ids:
+        # screen the head pool on the initial scene (= the first check frame): keep views
+        # that see the needed grippers and are not blocked by the robot's own base / mast
+        def first_ok(c):
+            s = segcam.seg(task.scene, c["mat"])
+            n = {a: int(np.isin(s, list(grip_ids[a])).sum()) for a in ("left", "right")}
+            g = max(n.values()) >= px_min if need is None else all(n[a] >= px_min for a in need)
+            return g and np.isin(s, body_ids).mean() <= cfg.head_max_body_frac
+        pool = len(cands)
+        cands = [c for c in cands if first_ok(c)][:cfg.head_gate_candidates]
+        if not cands:
+            return {"ok": False, "reason": f"no head camera of {pool} sees both hands unblocked",
+                    "alive": 0, "candidates": pool}
     alive = list(range(len(cands)))
     px_log = {i: [] for i in range(len(cands))}
     wfrac = {a: {i: [] for i in range(len(wrist_cands[a]))} for a in ("left", "right")}
@@ -373,6 +402,9 @@ def gate_and_select(task, reset_fn, stream, cfg, rng, args, n_views, frame_strid
                 ok = max(counts.values()) >= px_min
             else:
                 ok = all(counts[a] >= px_min for a in need)
+            # a head camera must see past the robot's own frame (e.g. a mast between the arms)
+            if ok and body_ids and np.isin(s, body_ids).mean() > cfg.head_max_body_frac:
+                ok = False
             if ok:
                 still.append(i)
         alive = still
