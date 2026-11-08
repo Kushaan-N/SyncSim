@@ -355,11 +355,20 @@ class Generator:
 
     # ------------------------------------------------------------------------------------
     def _drop(self, seed, reason):
+        # queue runs put several workers on one task dir: read-merge-write under a lock, or
+        # each worker's stale in-memory copy overwrites the others' drops
+        import fcntl
         self.dropped[int(seed)] = reason
-        tmp = self.dropped_path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump({str(k): v for k, v in sorted(self.dropped.items())}, f, indent=1)
-        os.replace(tmp, self.dropped_path)
+        with open(self.dropped_path + ".lock", "w") as lk:
+            fcntl.flock(lk, fcntl.LOCK_EX)
+            if os.path.exists(self.dropped_path):
+                with open(self.dropped_path) as f:
+                    on_disk = {int(k): v for k, v in json.load(f).items()}
+                self.dropped = {**on_disk, **self.dropped}
+            tmp = f"{self.dropped_path}.tmp.{os.getpid()}"
+            with open(tmp, "w") as f:
+                json.dump({str(k): v for k, v in sorted(self.dropped.items())}, f, indent=1)
+            os.replace(tmp, self.dropped_path)
 
     def _reset(self, seed):
         import sapien
