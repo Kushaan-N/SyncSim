@@ -60,13 +60,21 @@ def build(a):
         with open(os.path.join(d, "seed.txt")) as f:
             n = len(f.read().split())
         n = min(n, a.max_episodes) if a.max_episodes else n
-        for s in range(0, n, a.chunk):
+        for s in range(a.start_episode, n, a.chunk):
             items.append({"id": f"{ev}/{task}/{s:04d}", "task": task, "release_dir": d,
                           "output_dir": os.path.join(a.output_root, ev),
-                          "start": s, "count": min(a.chunk, n - s)})
+                          "start": s, "count": min(a.chunk, n - s),
+                          "_frac": (s - a.start_episode + min(a.chunk, n - s) / 2) / (n - a.start_episode)})
     # interleave tasks / embodiments so early results cover everything and no single task's
     # GPU-heavy scenes pile up on one node
     random.Random(0).shuffle(items)
+    if a.order == "even":
+        # every release dir advances at the same fraction of its own episodes, so a run cut
+        # short at any point holds about the same share of every robot x task (stable sort:
+        # ties keep the shuffled order)
+        items.sort(key=lambda it: it["_frac"])
+    for it in items:
+        it.pop("_frac")
     os.makedirs(a.queue, exist_ok=True)
     path = os.path.join(a.queue, "items.jsonl")
     old = set()
@@ -290,6 +298,10 @@ def main():
     b.add_argument("--tasks", default="")
     b.add_argument("--variants", default="")
     b.add_argument("--max_episodes", type=int, default=0, help="per release dir (0 = all)")
+    b.add_argument("--start_episode", type=int, default=0,
+                   help="first release episode per dir (extend an earlier, capped build)")
+    b.add_argument("--order", choices=("shuffle", "even"), default="shuffle",
+                   help="even: every dir progresses at the same fraction (safe to cut short)")
     w = sub.add_parser("work")
     w.add_argument("--queue", required=True)
     w.add_argument("--gpu", default="0")
