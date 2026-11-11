@@ -351,6 +351,9 @@ At release scale a redo runs through the work queue: an item with a `redo_list` 
 * **Throughput.** Rendering (ray tracing) is the bottleneck: one RTX PRO 6000 is ~96% busy
   with 4 workers. `scripts/queue_worker.py` spreads ~10-episode items over all workers in
   roughly FIFO order (clean before randomized), interleaving tasks and robots so a partial
-  run is balanced. Claims are `mkdir`s with a heartbeat; a claim idle for 15 min is taken
+  run is balanced. `build --order even` makes that exact: items are sorted by how far
+  through its own release dir each one is, so a run cut short at any point holds the same
+  fraction (within one 10-episode chunk) of every robot x task; `--start_episode` extends
+  an earlier build that was capped with `--max_episodes`. Claims are `mkdir`s with a heartbeat; a claim idle for 15 min is taken
   over, so preempted jobs lose at most the episode in flight.
 
