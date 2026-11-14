@@ -76,6 +76,40 @@ SyncSim (`cameras.py`):
 No base-motion filter and no camera-drift filter: RoboTwin robots are fixed-base and the
 cameras are world-static, so both robocasa failure modes cannot occur.
 
+### 2b. Head cameras (`--camera_mode head`)
+
+The orbit sampler above is replaced by an egocentric placement
+(`cameras.sample_head_candidates`); gating, multi-view selection and everything downstream are
+unchanged. A pose is built from the two arm bases ("shoulders"):
+
+| parameter | range | config field |
+|---|---|---|
+| lateral position | ± 50 % of the half shoulder span, from the midpoint between the arm bases | `head_lateral_frac` |
+| along the forward axis from the shoulder line | −0.40 m (behind) to +0.20 m (in front) | `head_back_m` |
+| height above the table top | 0.45 to 0.95 m (stock RoboTwin head camera: 0.61) | `head_height_m` |
+| pitch, looking down | 30° to 65° (stock: 53°) | `head_pitch_deg` |
+| yaw | ± 12° around straight ahead | `head_yaw_deg` |
+| vertical field of view | 70° (replaces `fovy_deg`) | `head_fovy_deg` |
+
+* **Why wide-angle**: the hands sit out at the sides of a head between the shoulders; a normal
+  lens at that distance cannot hold both.
+* **Own-body gate**: on top of the both-hands gate, a view is rejected if the robot's own
+  base or mast covers more than 5 % of the image (`head_max_body_frac`) — some embodiments
+  have a mast between the arms, exactly where a head goes.
+* **More candidates, more checks**: `head_pool` = 768 candidates are screened on the initial
+  scene, the best `head_gate_candidates` = 192 go through the replay gate, and visibility is
+  checked at `head_check_frames` = 24 frames instead of the orbit default, because a close-up
+  view loses a hand more easily.
+* **Near plane**: the ray tracer does not clip near geometry but the rasterised gate camera
+  does, so head mode uses the mask near plane for the gate to keep the two consistent.
+* **Baseline**: the published head set was generated with `MIN_SEPARATION_DEG=10`, so its two
+  views are at least 10° apart (the orbit default of 45° is not reachable from a head-sized
+  volume).
+* The sampled values are stored per view under `views.json["views"][i]["head"]`.
+
+The published head-camera set was checked after release; problems are recorded per episode
+in the index (`quality_ok`, `quality_flags`) instead of removing the episodes.
+
 ## 3. Wrist cameras
 
 Two wrist cameras (one per arm) on RoboTwin's `left_camera` / `right_camera` links, each with a
