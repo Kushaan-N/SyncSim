@@ -46,21 +46,18 @@ scripts/queue_worker.py       shared work queue (build / work / status) for rele
 scripts/queue.sbatch          one node of a queue run: WORKERS_PER_GPU workers per GPU
 ```
 
-## Environment (AICR cluster)
+## Environment
 
-- Conda env: `/work/umass/chuangg_umass/yuncongyang_umass/syncsim/envs/rt` (python 3.10; a
-  `conda create --clone` of the old /scratch env, moved 2026-10-25: /scratch's 30-day purge
-  goes by file mtime and conda keeps package build mtimes, so it kept deleting env files --
-  libstdc++, libexpat, ... -- and `import sapien` broke). Never put the env back on /scratch.
-  RoboTwin checkout:
-  `/home/yuncongyang_umass/kn/RoboTwin` (`ROBOTWIN_ROOT`), assets downloaded there.
+- Conda env (python 3.10; scripts take its interpreter as `PYTHON_BIN`), kept outside any filesystem with a purge policy: a purge
+  that goes by file mtime deletes env files, because conda keeps package build mtimes, and
+  `import sapien` breaks (libstdc++, libexpat, ...). RoboTwin checkout at `$ROBOTWIN_ROOT`,
+  assets downloaded there.
 - GPUs are Blackwell (RTX PRO 6000 sm_120, B200 sm_100): torch is **2.7.1+cu128**, not
   RoboTwin's pinned 2.4.1; curobo v0.7.8 is compiled with `TORCH_CUDA_ARCH_LIST="10.0;12.0"`
-  against conda's CUDA 12.8 (`/scratch/yuncongyang_umass/syncsim/install_curobo.sh`).
-- **The login node is a QEMU VM without AVX**: `import open3d` (hence RoboTwin) dies with
-  "Illegal instruction" there. Run anything that imports RoboTwin on a compute node.
-- Use partition **`rtx-batch`** (account `chuangg_umass`): SAPIEN's `rt` shader needs RT cores,
-  which B200s lack. `rtx-devel` is a single node and usually full.
+  against conda's CUDA 12.8.
+- `open3d` (hence RoboTwin) needs AVX: a node without it dies with "Illegal instruction", so
+  run anything that imports RoboTwin on a compute node.
+- SAPIEN's `rt` shader needs RT cores: use RTX-class GPUs (the RTX PRO 6000s), not B200s.
 - RoboTwin paths are relative (`./assets`), so code `chdir`s into `ROBOTWIN_ROOT`
   (`rt_env.enter_robotwin`). Run the generator as a module from the repo root.
 
