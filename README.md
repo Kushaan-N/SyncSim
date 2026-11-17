@@ -73,17 +73,22 @@ Every rollout is filmed by four cameras at ~21 fps (384×384 in the published da
 
 * **two third-person cameras**, placed at random around the robot for each episode (varied
   angle, height and distance, at least 45° apart), and kept only if both hands stay visible
-  throughout;
+  throughout the expert;
 * **one camera on each wrist**, with a slightly jittered mount.
 
 With `--camera_mode head` the two third-person cameras are **head cameras** instead: placed
 between the two arms the way a humanoid's head would be, set back and raised by random amounts,
 looking forward and down at the robot's own hands through a wide lens (70° vertical field of
 view). Each episode samples two such poses at least 10° apart, and a pose is kept only if both
-grippers stay visible and the robot's own base or mast covers at most 5 % of the image.
+grippers stay visible during the expert and the robot's own base or mast covers at most 5 % of the image.
 
 The expert, calibration and counterfactuals of an episode share the same cameras, so they can
-be compared frame by frame.
+be compared frame by frame. The visibility check runs on the expert, so a hand can briefly leave
+the view in a calibration clip or counterfactual.
+
+Episodes with the same task and seed, on different robots or scene styles, share their random
+camera and counterfactual draws. When splitting the data into train and test, split by
+(task, seed), not by robot or scene style.
 
 ### Labels
 
